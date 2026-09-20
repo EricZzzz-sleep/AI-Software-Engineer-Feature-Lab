@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Campaign editing space</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/editor.js" defer></script>
+</head>
+<body>
+  <main>
+    <div class="session-bar" id="session-bar" hidden>
+      <div><label for="actor">Test session</label><select id="actor"><option value="">Choose an actor</option></select></div>
+      <button id="signin" type="button">Sign in</button>
+      <span id="identity"></span>
+    </div>
+    <p id="notice" role="status" aria-live="polite">Loading editing space…</p>
+    <div class="campaign-picker" id="picker" hidden><label for="campaign">Campaign</label><select id="campaign"></select></div>
+    <article id="editor" hidden aria-labelledby="title">
+      <header><h1 id="title">Campaign</h1><span id="saved">Saved</span></header>
+      <div class="panes">
+        <section aria-labelledby="brief-heading">
+          <h2 id="brief-heading">Brief</h2>
+          <div class="field-panel">
+            <label for="goal">Goal + audience</label><textarea id="goal" rows="3" maxlength="20000"></textarea>
+            <label for="facts">Source facts</label><textarea id="facts" rows="3" maxlength="20000"></textarea>
+            <label for="tone">Tone</label><input id="tone" maxlength="20000">
+          </div>
+          <div class="actions"><button id="save" type="button">Save</button><button id="generate" type="button" disabled aria-describedby="generate-reason">Generate</button></div>
+          <p class="hint" id="generate-reason">Generation is not configured</p>
+        </section>
+        <section aria-labelledby="draft-heading">
+          <h2 id="draft-heading">Draft</h2>
+          <div class="field-panel draft-panel"><label for="draft">Draft text</label><textarea id="draft" maxlength="20000"></textarea><p class="hint" id="draft-status">Editable text</p></div>
+          <div class="actions"><button id="review" type="button" aria-describedby="workflow-reason">Review</button><button id="publish" type="button" class="primary" aria-describedby="workflow-reason">Publish</button></div>
+          <p class="hint" id="workflow-reason"></p>
+        </section>
+      </div>
+      <div class="recovery"><p id="status" role="status" aria-live="polite"></p><button id="reload" type="button">Reload saved content</button></div>
+      <section id="publications" aria-labelledby="publications-heading" hidden><h2 id="publications-heading">Published versions</h2><div id="publication-list"></div></section>
+    </article>
+  </main>
+  <dialog id="dialog" aria-labelledby="dialog-title" aria-describedby="dialog-description">
+    <h2 id="dialog-title"></h2><p id="dialog-description"></p><div id="dialog-content"></div>
+    <div class="actions"><button id="dialog-cancel" type="button">Cancel</button><button id="dialog-confirm" type="button" class="primary">Confirm</button></div>
+  </dialog>
+</body>
+</html>
