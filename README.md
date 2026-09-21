@@ -62,10 +62,24 @@ read-only snapshots available under Published versions; later edits never change
 them. Repeating a successful publication returns the same snapshot, even after
 newer edits exist.
 
-Generate is intentionally disabled. Dirty content explains that changes need to
-be saved; saved content explains that generation is not configured. **No provider,
-generation jobs, job status endpoint, or worker exists in this phase.** Any future
-worker/status implementation must apply the same workspace/role policy.
+Generate calls the server, which sends the current goal/audience, source facts, tone, and previous draft to the [OpenAI Responses API](https://developers.openai.com/api/docs/guides/text).
+Copy `.env.example` to `.env`, set `OPENAI_API_KEY`, and restart `npm run dev`.
+`OPENAI_MODEL` defaults to `gpt-4.1-mini` and can be changed to a Responses-compatible
+text model available to your account. Both dev and production start commands load
+`.env`; existing environment variables take precedence. The key stays on the server.
+
+Select Generate using the current brief, including unsaved edits. A goal/audience
+is required; facts and tone are optional. Generate can be used again after each
+request without saving first; the previous draft is included to request different
+wording and structure. Save is available even without changes and during generation. The result replaces the local draft and remains unsaved until
+Save is selected. The prior saved version remains available through Reload saved
+content. Review and publish stay disabled while the generated draft is unsaved.
+Generation never automatically saves, reviews, or publishes. Provider errors and
+60-second timeouts preserve existing text. Concurrent generation for the same
+campaign is rejected within the server process, and conflicting brief changes while generating
+reject the stale result. Saving the requested brief or just the draft during
+generation is allowed. Requests are not automatically retried. Responses are
+requested with `store: false`; the brief is still transmitted to OpenAI for processing.
 
 Saving failures and stale-version conflicts preserve local text. A conflict returns
 409 and requires an explicit reload to see newer server content; reloading or
@@ -78,7 +92,7 @@ warns while dirty; local unsaved text is not persisted across a confirmed page e
 
 | Actor | Workspace | Permissions |
 | --- | --- | --- |
-| Maya / editor | A | Read, save brief, edit/save draft |
+| Maya / editor | A | Read, save brief, edit/save draft, generate |
 | Ren / publisher | A | Editor actions plus review/publish |
 | Evan / viewer | A | Read only, including publication snapshots |
 | Priya / editor | B | Edit B; no access to A's objects |
@@ -100,6 +114,7 @@ stored as SHA-256 hashes, and expire after one hour.
 | `GET /api/campaigns` | Accessible campaigns only |
 | `GET /api/campaigns/:id` | Current saved content, version, review flag, publication list |
 | `PUT /api/campaigns/:id` | Atomic save with `expectedVersion`, `goal`, `facts`, `tone`, `draft` |
+| `POST /api/campaigns/:id/generate` | Generate with `expectedVersion`, optional `goal`/`facts`/`tone` (all three together), and optional `previousDraft`; returns unsaved `{ draft, expectedVersion }` |
 | `POST /api/campaigns/:id/review` | Review `{ "expectedVersion": 1 }` |
 | `POST /api/campaigns/:id/publish` | Publish `{ "expectedVersion": 1 }`; requires review |
 | `GET /api/campaigns/:id/publications/:publicationId` | Immutable publication with JSON snapshot |
@@ -135,3 +150,22 @@ focus return, keyboard order, live status, and layouts at 1440, 960, 959, 390, a
 720 CSS px. A separate isolated Chromium test sets actual browser zoom to 200%,
 checks reflow, and completes review at that zoom level. Desktop/mobile/zoom
 screenshots are emitted under ignored `test-results/` for visual inspection.
+
+### Reviewing saved versions
+
+Publishers such as Ren have **Edit campaign** and **Review versions** tabs. The
+review tab lists all saved revisions, newest first, with review indicators. Choose
+a revision to inspect its read-only brief/draft, author, and save time, then select
+**Review selected version** and confirm. Approval applies only to that revision;
+reviewing an older version never approves or replaces the current revision.
+Switching tabs preserves unsaved editor input. Publishing continues to require
+review of the current saved revision.
+
+Publisher-only, workspace-scoped endpoints:
+
+- `GET /api/campaigns/:id/versions`: version summaries, newest first.
+- `GET /api/campaigns/:id/versions/:version`: immutable saved content and review state.
+- `POST /api/campaigns/:id/versions/:version/review` with `{}`: idempotently approve
+  that exact saved revision, even if a newer revision has since been saved.
+
+The existing current-version review endpoint retains its stale-version check.

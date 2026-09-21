@@ -6,7 +6,9 @@ let actorId = sessionStorage.getItem('lab-actor') || '';
 let current = null;
 let busy = false;
 let expired = false;
+let generating = false;
 let actorOptions = [];
+let selectedVersion = null;
 const values = () => Object.fromEntries(fields.map(key => [key, $(key).value]));
 const dirty = () => current && fields.some(key => $(key).value !== current[key]);
 function announce(message) { $('status').textContent = message; }
@@ -14,19 +16,24 @@ function controls() {
   const changed = dirty();
   const editable = current && current.role !== 'viewer';
   const publisher = current?.role === 'publisher';
-  fields.forEach(key => { $(key).readOnly = !editable || busy; });
-  $('save').disabled = !editable || !changed || busy || expired;
-  $('generate-reason').textContent = changed ? 'Save your changes before generating' : 'Generation is not configured';
-  $('review').disabled = !publisher || !!changed || busy || expired;
-  $('publish').disabled = !publisher || !!changed || busy || expired || !current?.reviewed;
-  $('workflow-reason').textContent = !publisher ? 'Only a publisher can review and publish.' : expired ? 'Sign in again to continue.' : busy ? 'Wait for saving to finish.' : changed ? 'Save your changes before review or publish.' : !current?.reviewed ? 'Review this saved version before publishing.' : 'This saved version is reviewed and ready to publish.';
+  $('editor-tabs').hidden = !publisher;
+  for (const id of ['edit-tab', 'versions-tab', 'version-select']) $(id).disabled = busy || generating;
+  $('review-version').disabled = !publisher || busy || generating || expired || !selectedVersion || selectedVersion.reviewed;
+  fields.forEach(key => { $(key).readOnly = !editable || busy || generating; });
+  $('save').disabled = !editable || busy || expired;
+  $('generate').disabled = !editable || busy || generating || expired || !current?.generationEnabled || !$('goal').value.trim();
+  $('generate').textContent = generating ? 'Generating…' : 'Generate';
+  $('generate-reason').textContent = !editable ? 'Only editors and publishers can generate.' : !current?.generationEnabled ? 'Generation is not configured' : !$('goal').value.trim() ? 'Add a goal and audience before generating.' : 'Generate a new variation from this brief. Save the draft you want to keep.';
+  $('review').disabled = !publisher || !!changed || busy || generating || expired;
+  $('publish').disabled = !publisher || !!changed || busy || generating || expired || !current?.reviewed;
+  $('workflow-reason').textContent = !publisher ? 'Only a publisher can review and publish.' : expired ? 'Sign in again to continue.' : busy ? 'Wait for the current action to finish.' : changed ? 'Save your changes before review or publish.' : !current?.reviewed ? 'Review this saved version before publishing.' : 'This saved version is reviewed and ready to publish.';
   $('saved').textContent = busy ? 'Working…' : changed ? `Unsaved · v${current?.version}` : `Saved v${current?.version}`;
   $('draft-status').textContent = editable ? 'Editable text · saved with the brief' : 'Read only';
-  $('actor').disabled = busy;
-  $('campaign').disabled = busy;
-  $('signin').disabled = busy;
-  $('reload').disabled = busy;
-  document.querySelectorAll('#publication-list button').forEach(button => { button.disabled = busy; });
+  $('actor').disabled = busy || generating;
+  $('campaign').disabled = busy || generating;
+  $('signin').disabled = busy || generating;
+  $('reload').disabled = busy || generating;
+  document.querySelectorAll('#publication-list button').forEach(button => { button.disabled = busy || generating; });
 }
 async function api(path, method = 'GET', data) {
   const response = await fetch(path, { method, headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(data ? { 'Content-Type': 'application/json' } : {}) }, body: data ? JSON.stringify(data) : undefined });
@@ -66,6 +73,8 @@ async function discardAllowed() {
 }
 function render(data) {
   current = data;
+  selectedVersion = null;
+  showEditorTab(false);
   fields.forEach(key => { $(key).value = data[key]; });
   $('title').textContent = `Campaign / ${data.title}`;
   $('editor').hidden = false;
@@ -135,9 +144,27 @@ $('campaign').onchange = async () => {
 fields.forEach(key => $(key).addEventListener('input', () => { controls(); announce(dirty() ? 'Unsaved changes' : `Saved version ${current.version}`); }));
 $('save').onclick = async () => {
   busy = true; controls(); announce('Saving brief and draft…');
-  try { render(await api(`/api/campaigns/${current.id}`, 'PUT', { expectedVersion: current.version, ...values() })); announce(`Saved version ${current.version}.`); }
+  try {
+    const submitted = values();
+    const saved = await api(`/api/campaigns/${current.id}`, 'PUT', { expectedVersion: current.version, ...submitted });
+    const local = values();
+    render(saved);
+    // A generation response may arrive while this save is in flight.
+    fields.forEach(key => { if (local[key] !== submitted[key]) $(key).value = local[key]; });
+    announce(`Saved version ${current.version}.${dirty() ? ' New generated draft is still unsaved.' : ''}`);
+  }
   catch (error) { announce(`Save failed. ${errorMessage(error)}`); }
   finally { busy = false; controls(); }
+};
+$('generate').onclick = async () => {
+  if ($('generate').disabled) return;
+  generating = true; controls(); announce('Generating a new draft variation…');
+  try {
+    const result = await api(`/api/campaigns/${current.id}/generate`, 'POST', { expectedVersion: current.version, goal: $('goal').value, facts: $('facts').value, tone: $('tone').value, previousDraft: $('draft').value });
+    $('draft').value = result.draft;
+    announce('Draft generated. Edit it as needed, then save before review or publish.');
+  } catch (error) { announce(`Generation failed. ${errorMessage(error)} Your existing text has been kept.`); }
+  finally { generating = false; controls(); $('draft').focus(); }
 };
 $('reload').onclick = async () => {
   if (!await discardAllowed()) return;
@@ -175,3 +202,66 @@ async function initialize() {
   } catch (error) { $('notice').textContent = errorMessage(error); }
 }
 initialize();
+
+function showEditorTab(history) {
+  $('edit-panel').hidden = history;
+  $('versions-panel').hidden = !history;
+  $('edit-tab').setAttribute('aria-selected', String(!history));
+  $('versions-tab').setAttribute('aria-selected', String(history));
+  $('edit-tab').tabIndex = history ? -1 : 0;
+  $('versions-tab').tabIndex = history ? 0 : -1;
+}
+function renderVersion(data) {
+  selectedVersion = data;
+  $('version-preview').textContent = preview(data);
+  $('version-meta').textContent = `Version ${data.version} · Saved by ${data.author} · ${data.saved_at} · ${data.reviewed ? 'Reviewed' : 'Not reviewed'}`;
+}
+async function loadSelectedVersion() {
+  selectedVersion = null;
+  $('version-preview').textContent = '';
+  $('version-meta').textContent = '';
+  const data = await api(`/api/campaigns/${current.id}/versions/${$('version-select').value}`);
+  renderVersion(data);
+}
+$('edit-tab').onclick = () => showEditorTab(false);
+$('versions-tab').onclick = async () => {
+  if (busy || current?.role !== 'publisher') return;
+  showEditorTab(true);
+  selectedVersion = null;
+  $('version-preview').textContent = ''; $('version-meta').textContent = '';
+  busy = true; controls(); $('versions-status').textContent = 'Loading saved versions…';
+  try {
+    const versions = await api(`/api/campaigns/${current.id}/versions`);
+    $('version-select').replaceChildren(...versions.map(v => new Option(`Version ${v.version}${v.reviewed ? ' · Reviewed' : ''}`, v.version)));
+    if (versions.length) await loadSelectedVersion();
+    $('versions-status').textContent = versions.length ? 'Choose a saved version to inspect and review. Your editor input is kept.' : 'No saved versions are available.';
+  } catch (error) { $('versions-status').textContent = errorMessage(error); }
+  finally { busy = false; controls(); }
+};
+$('version-select').onchange = async () => {
+  busy = true; controls();
+  try { await loadSelectedVersion(); $('versions-status').textContent = `Saved version ${selectedVersion.version} loaded.`; }
+  catch (error) { $('versions-status').textContent = errorMessage(error); }
+  finally { busy = false; controls(); }
+};
+$('review-version').onclick = async () => {
+  if ($('review-version').disabled) return;
+  const saved = selectedVersion;
+  const id = current.id;
+  if (!await showDialog(`Review saved v${saved.version}`, 'Review this saved brief and draft, then confirm approval of this version only.', preview(saved), 'Confirm review')) return;
+  busy = true; controls();
+  try {
+    const result = await api(`/api/campaigns/${id}/versions/${saved.version}/review`, 'POST', {});
+    renderVersion(result);
+    $('version-select').selectedOptions[0].textContent = `Version ${saved.version} · Reviewed`;
+    if (current.version === saved.version) current.reviewed = true;
+    $('versions-status').textContent = `Version ${saved.version} reviewed.`;
+  } catch (error) { $('versions-status').textContent = errorMessage(error); }
+  finally { busy = false; controls(); $('version-select').focus(); }
+};
+for (const id of ['edit-tab', 'versions-tab']) $(id).onkeydown = event => {
+  if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+  event.preventDefault();
+  const target = event.key === 'Home' ? 'edit-tab' : event.key === 'End' ? 'versions-tab' : id === 'edit-tab' ? 'versions-tab' : 'edit-tab';
+  if (!$(target).disabled) { $(target).focus(); $(target).click(); }
+};

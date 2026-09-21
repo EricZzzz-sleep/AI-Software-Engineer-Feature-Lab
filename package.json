@@ -7,12 +7,12 @@
     "node": ">=24.0.0"
   },
   "scripts": {
-    "dev": "NODE_ENV=development tsx watch src/server.ts",
+    "dev": "NODE_ENV=development tsx watch --env-file-if-exists=.env src/server.ts",
     "test": "NODE_ENV=test tsx --test tests/*.test.ts",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "build": "tsc -p tsconfig.build.json",
-    "start": "NODE_ENV=production node dist/server.js",
+    "start": "NODE_ENV=production node --env-file-if-exists=.env dist/server.js",
     "db:migrate": "tsx src/cli.ts migrate",
     "db:seed": "tsx src/cli.ts seed",
     "db:reset": "tsx src/cli.ts reset",

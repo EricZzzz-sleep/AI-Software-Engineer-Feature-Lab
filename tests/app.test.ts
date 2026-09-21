@@ -6,13 +6,15 @@ import { join } from 'node:path';
 import { once } from 'node:events';
 import type { AddressInfo } from 'node:net';
 import { DatabaseSync } from 'node:sqlite';
+import { mutate } from '../src/campaigns.js';
+import { type DraftGenerator } from '../src/generation.js';
 import { createApp } from '../src/app.js';
 import { actors, openDatabase, seed } from '../src/db.js';
 
-async function harness(env = 'test') {
+async function harness(env = 'test', generator: DraftGenerator | null = null) {
   const db = openDatabase(':memory:');
   seed(db, 'test');
-  const server = createApp(db, env);
+  const server = createApp(db, env, generator);
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
   const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
@@ -137,4 +139,120 @@ test('forward migration preserves legacy data; campaign versions survive reopeni
     assert.equal(db.prepare('SELECT count(*) AS n FROM migrations').get()?.n, 2);
     db.close();
   } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+
+test('generation uses saved brief, enforces permissions, and leaves saved content unchanged', async () => {
+  const briefs: unknown[] = [];
+  const app = await harness('test', async brief => { briefs.push(brief); return 'Generated copy'; });
+  try {
+    const token = await app.session('maya');
+    const path = '/api/campaigns/launch/generate';
+    assert.equal((await app.request(path, 'POST', { expectedVersion: 1 })).status, 401);
+    for (const [actor, status] of [['evan', 403], ['priya', 404]] as const) {
+      assert.equal((await app.request(path, 'POST', { expectedVersion: 1 }, await app.session(actor))).status, status);
+    }
+    for (const data of [{ expectedVersion: 0 }, { expectedVersion: 1, goal: 'Forged' }]) {
+      assert.equal((await app.request(path, 'POST', data, token)).status, 400);
+    }
+    assert.equal((await app.request(path, 'POST', { expectedVersion: 2 }, token)).status, 409);
+    assert.equal(briefs.length, 0);
+    const before = await (await app.request('/api/campaigns/launch', 'GET', undefined, token)).json();
+    assert.deepEqual(await (await app.request(path, 'POST', { expectedVersion: 1 }, token)).json(), { draft: 'Generated copy', expectedVersion: 1 });
+    assert.deepEqual(briefs, [{ goal: before.goal, facts: before.facts, tone: before.tone }]);
+    assert.deepEqual(await (await app.request('/api/campaigns/launch', 'GET', undefined, token)).json(), before);
+    await app.request('/api/campaigns/launch', 'PUT', { ...content, goal: '  ', expectedVersion: 1 }, token);
+    assert.equal((await app.request(path, 'POST', { expectedVersion: 2 }, token)).status, 400);
+  } finally { await app.close(); }
+});
+
+test('generation rejects duplicates and stale results, then releases the campaign lock', async () => {
+  let finish!: (draft: string) => void;
+  let started!: () => void;
+  const pending = new Promise<void>(resolve => { started = resolve; });
+  const app = await harness('test', () => { started(); return new Promise(resolve => { finish = resolve; }); });
+  try {
+    const token = await app.session('maya');
+    const path = '/api/campaigns/launch/generate';
+    const generation = app.request(path, 'POST', { expectedVersion: 1 }, token);
+    await pending;
+    assert.equal((await app.request(path, 'POST', { expectedVersion: 1 }, token)).status, 409);
+    await app.request('/api/campaigns/launch', 'PUT', { ...content, expectedVersion: 1 }, token);
+    finish('Obsolete output');
+    assert.equal((await generation).status, 409);
+    const saved = await (await app.request('/api/campaigns/launch', 'GET', undefined, token)).json();
+    assert.equal(saved.draft, content.draft);
+  } finally { await app.close(); }
+});
+
+test('missing generation configuration returns an actionable error', async () => {
+  const app = await harness();
+  try {
+    const response = await app.request('/api/campaigns/launch/generate', 'POST', { expectedVersion: 1 }, await app.session('maya'));
+    assert.equal(response.status, 503);
+    assert.match((await response.json()).error, /OPENAI_API_KEY/);
+  } finally { await app.close(); }
+});
+
+test('generation accepts local brief variations and allows saving that brief during the request', async () => {
+  let finish!: (draft: string) => void;
+  let start!: () => void;
+  const started = new Promise<void>(resolve => { start = resolve; });
+  const brief = { goal: 'Local goal', facts: 'Local facts', tone: 'Warm', previousDraft: 'Previous variation' };
+  const app = await harness('test', input => {
+    assert.deepEqual(input, brief);
+    start();
+    return new Promise(resolve => { finish = resolve; });
+  });
+  try {
+    const token = await app.session('maya');
+    const generation = app.request('/api/campaigns/launch/generate', 'POST', { expectedVersion: 1, ...brief }, token);
+    await started;
+    assert.equal((await app.request('/api/campaigns/launch', 'PUT', { expectedVersion: 1, goal: brief.goal, facts: brief.facts, tone: brief.tone, draft: brief.previousDraft }, token)).status, 200);
+    finish('Next variation');
+    assert.equal((await generation).status, 200);
+    const saved = await (await app.request('/api/campaigns/launch', 'GET', undefined, token)).json();
+    assert.equal(saved.draft, brief.previousDraft);
+    assert.equal(saved.version, 2);
+  } finally { await app.close(); }
+});
+
+test('publishers can inspect and review any saved version without changing the current revision', async () => {
+  const app = await harness();
+  try {
+    for (let version = 2; version <= 7; version++) mutate(app.db, 'maya', 'launch', 'save', { ...content, draft: `Campaign draft revision ${version}.`, expectedVersion: version - 1 });
+    const token = await app.session('ren');
+    const req = (suffix: string, method = 'GET', data?: unknown, auth = token) => app.request('/api/campaigns/launch' + suffix, method, data, auth);
+    const versions = await (await req('/versions')).json();
+    assert.deepEqual(versions.map((v: { version: number }) => v.version), [7, 6, 5, 4, 3, 2, 1]);
+    const before = await (await req('')).json();
+    const older = await (await req('/versions/3')).json();
+    assert.equal(older.draft, 'Campaign draft revision 3.');
+    assert.equal((await req('/versions/3/review', 'POST', { role: 'publisher' })).status, 400);
+    const reviewed = await (await req('/versions/3/review', 'POST', {})).json();
+    assert.equal(reviewed.version, 3);
+    assert.equal(reviewed.reviewed, true);
+    assert.equal(reviewed.draft, older.draft);
+    assert.deepEqual(await (await req('')).json(), before);
+    assert.deepEqual(await (await req('/versions/3/review', 'POST', {})).json(), reviewed);
+    assert.equal(app.db.prepare('SELECT count(*) AS n FROM reviews').get()?.n, 1);
+    assert.equal((await req('/publish', 'POST', { expectedVersion: 7 })).status, 409);
+    // Review a snapshot even after another editor saves a newer version.
+    await req('', 'PUT', { ...content, expectedVersion: 7 });
+    assert.equal((await req('/versions/7/review', 'POST', {})).status, 200);
+    const latest = await (await req('')).json();
+    assert.equal(latest.version, 8);
+    assert.equal(latest.reviewed, false);
+    for (const actor of ['maya', 'evan', 'priya']) {
+      const auth = await app.session(actor);
+      for (const suffix of ['/versions', '/versions/3', '/versions/3/review']) {
+        assert.equal((await req(suffix, suffix.endsWith('/review') ? 'POST' : 'GET', suffix.endsWith('/review') ? {} : undefined, auth)).status, actor === 'priya' ? 404 : 403);
+      }
+    }
+    assert.equal((await app.request('/api/campaigns/launch/versions')).status, 401);
+    assert.equal((await req('/versions/999')).status, 404);
+    assert.equal((await req('/versions/999/review', 'POST', {})).status, 404);
+    assert.equal((await req('/versions/0')).status, 400);
+    assert.equal((await app.request('/api/campaigns/missing/versions', 'GET', undefined, token)).status, 404);
+  } finally { await app.close(); }
 });

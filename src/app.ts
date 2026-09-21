@@ -3,7 +3,8 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { readFileSync } from 'node:fs';
 import type { DatabaseSync } from 'node:sqlite';
 import { actors, isTestEnvironment, seed } from './db.js';
-import { access, detail, HttpError, mutate, only } from './campaigns.js';
+import { openAIGenerator, type DraftGenerator } from './generation.js';
+import { access, detail, HttpError, mutate, only, versionHistory, versionDetail, reviewVersion } from './campaigns.js';
 
 const hash = (token: string) => createHash('sha256').update(token).digest('hex');
 async function body(req: IncomingMessage): Promise<Record<string, unknown>> {
@@ -25,7 +26,9 @@ function json(res: ServerResponse, status: number, value: unknown): void {
   res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
   res.end(JSON.stringify(value));
 }
-export function createApp(db: DatabaseSync, env: string | undefined) {
+export function createApp(db: DatabaseSync, env: string | undefined, generator: DraftGenerator | null = openAIGenerator({ apiKey: process.env.OPENAI_API_KEY, model: process.env.OPENAI_MODEL })) {
+  const generating = new Set<string>();
+  const campaignDetail = (actorId: string, id: string) => ({ ...detail(db, actorId, id), generationEnabled: !!generator });
   const fixturesEnabled = isTestEnvironment(env);
   return createServer(async (req, res) => {
     try {
@@ -71,12 +74,20 @@ export function createApp(db: DatabaseSync, env: string | undefined) {
         return res.end(readFileSync(new URL(`../public/${file}`, import.meta.url)));
       }
       if (method === 'GET' && path === '/health') return json(res, 200, { status: 'ok' });
-      const route = path.match(/^\/api\/campaigns\/([^/]+)(?:\/(review|publish|publications)(?:\/(\d+))?)?$/);
-      if (path !== '/api/me' && path !== '/api/campaigns' && !route) throw new HttpError(404, 'Not found');
+      const versionRoute = path.match(/^\/api\/campaigns\/([^/]+)\/versions(?:\/(\d+)(\/review)?)?$/);
+      const route = path.match(/^\/api\/campaigns\/([^/]+)(?:\/(review|publish|publications|generate)(?:\/(\d+))?)?$/);
+      if (path !== '/api/me' && path !== '/api/campaigns' && !route && !versionRoute) throw new HttpError(404, 'Not found');
       const token = req.headers.authorization?.match(/^Bearer ([a-f0-9]{64})$/)?.[1];
       const actor = token ? db.prepare(`SELECT a.id, a.name FROM sessions s JOIN actors a ON a.id = s.actor_id
         WHERE s.token_hash = ? AND s.expires_at > ?`).get(hash(token), Date.now()) : undefined;
       if (!actor || typeof actor.id !== 'string') throw new HttpError(401, 'Session expired. Sign in again; your text has been kept.');
+      if (versionRoute) {
+        const [, id, version, review] = versionRoute;
+        if (method === 'GET' && !version) return json(res, 200, versionHistory(db, actor.id, id!));
+        if (method === 'GET' && version && !review) return json(res, 200, versionDetail(db, actor.id, id!, Number(version)));
+        if (method === 'POST' && version && review) return json(res, 200, reviewVersion(db, actor.id, id!, Number(version), await body(req)));
+        throw new HttpError(405, 'Method not allowed');
+      }
       if (method === 'GET' && path === '/api/me') return json(res, 200, { ...actor,
         memberships: db.prepare('SELECT workspace_id, role FROM memberships WHERE actor_id = ?').all(actor.id) });
       if (method === 'GET' && path === '/api/campaigns') return json(res, 200,
@@ -85,8 +96,38 @@ export function createApp(db: DatabaseSync, env: string | undefined) {
         const id = route[1]!;
         const action = route[2];
         access(db, actor.id, id);
-        if (method === 'GET' && !action) return json(res, 200, detail(db, actor.id, id));
-        if (method === 'PUT' && !action) return json(res, 200, mutate(db, actor.id, id, 'save', await body(req)));
+        if (method === 'GET' && !action) return json(res, 200, campaignDetail(actor.id, id));
+        if (method === 'PUT' && !action) {
+          mutate(db, actor.id, id, 'save', await body(req));
+          return json(res, 200, campaignDetail(actor.id, id));
+        }
+        if (method === 'POST' && action === 'generate' && !route[3]) {
+          access(db, actor.id, id, 'save');
+          const input = await body(req);
+          only(input, ['expectedVersion', 'goal', 'facts', 'tone', 'previousDraft']);
+          if (!Number.isSafeInteger(input.expectedVersion) || Number(input.expectedVersion) < 1) throw new HttpError(400, 'A valid expectedVersion is required');
+          const saved: Record<string, unknown> = detail(db, actor.id, id);
+          if (saved.version !== input.expectedVersion) throw new HttpError(409, 'This campaign changed on the server. Reload before generating.');
+          const brief = { goal: String(saved.goal), facts: String(saved.facts), tone: String(saved.tone) };
+          if (['goal', 'facts', 'tone'].some(key => key in input)) {
+            for (const key of ['goal', 'facts', 'tone'] as const) {
+              if (typeof input[key] !== 'string' || input[key].length > 20000) throw new HttpError(400, `${key} must be text of at most 20,000 characters`);
+              brief[key] = input[key];
+            }
+          }
+          if (input.previousDraft !== undefined && (typeof input.previousDraft !== 'string' || input.previousDraft.length > 20000)) throw new HttpError(400, 'previousDraft must be text of at most 20,000 characters');
+          if (!brief.goal.trim()) throw new HttpError(400, 'Add a goal and audience to the brief before generating.');
+          if (!generator) throw new HttpError(503, 'Generation is not configured. Set OPENAI_API_KEY on the server.');
+          if (generating.has(id)) throw new HttpError(409, 'Generation is already in progress for this campaign.');
+          generating.add(id);
+          try {
+            const draft = await generator({ ...brief, ...(typeof input.previousDraft === 'string' ? { previousDraft: input.previousDraft } : {}) });
+            const latest = access(db, actor.id, id, 'save');
+            const latestContent: Record<string, unknown> = detail(db, actor.id, id);
+            if (latest.version !== saved.version && ['goal', 'facts', 'tone'].some(key => latestContent[key] !== saved[key] && latestContent[key] !== brief[key as keyof typeof brief])) throw new HttpError(409, 'This campaign changed during generation. Your text has been kept. Reload and try again.');
+            return json(res, 200, { draft, expectedVersion: saved.version });
+          } finally { generating.delete(id); }
+        }
         if (method === 'POST' && (action === 'review' || action === 'publish') && !route[3]) return json(res, 200, mutate(db, actor.id, id, action, await body(req)));
         if (method === 'GET' && action === 'publications' && route[3]) {
           const publication = db.prepare('SELECT * FROM publications WHERE campaign_id = ? AND id = ?').get(id, Number(route[3]));

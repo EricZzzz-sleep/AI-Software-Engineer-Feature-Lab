@@ -17,6 +17,11 @@
     <div class="campaign-picker" id="picker" hidden><label for="campaign">Campaign</label><select id="campaign"></select></div>
     <article id="editor" hidden aria-labelledby="title">
       <header><h1 id="title">Campaign</h1><span id="saved">Saved</span></header>
+      <div id="editor-tabs" role="tablist" aria-label="Campaign views" hidden>
+        <button id="edit-tab" type="button" role="tab" aria-selected="true" aria-controls="edit-panel">Edit campaign</button>
+        <button id="versions-tab" type="button" role="tab" aria-selected="false" aria-controls="versions-panel" tabindex="-1">Review versions</button>
+      </div>
+      <div id="edit-panel" role="tabpanel" aria-labelledby="edit-tab">
       <div class="panes">
         <section aria-labelledby="brief-heading">
           <h2 id="brief-heading">Brief</h2>
@@ -37,6 +42,16 @@
       </div>
       <div class="recovery"><p id="status" role="status" aria-live="polite"></p><button id="reload" type="button">Reload saved content</button></div>
       <section id="publications" aria-labelledby="publications-heading" hidden><h2 id="publications-heading">Published versions</h2><div id="publication-list"></div></section>
+      </div>
+      <section id="versions-panel" role="tabpanel" aria-labelledby="versions-tab" hidden>
+        <h2>Saved versions</h2>
+        <label for="version-select">Version to review</label>
+        <select id="version-select"></select>
+        <p id="version-meta"></p>
+        <div id="version-preview" tabindex="0" aria-label="Saved version content"></div>
+        <button id="review-version" type="button" disabled>Review selected version</button>
+        <p id="versions-status" role="status" aria-live="polite"></p>
+      </section>
     </article>
   </main>
   <dialog id="dialog" aria-labelledby="dialog-title" aria-describedby="dialog-description">
