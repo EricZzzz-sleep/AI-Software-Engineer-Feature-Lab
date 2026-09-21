@@ -13,6 +13,16 @@
       <button id="signin" type="button">Sign in</button>
       <span id="identity"></span>
     </div>
+    <!-- mentor-start -->
+    <section id="mentor-drills" hidden aria-labelledby="mentor-heading">
+      <h2 id="mentor-heading">Mentor drills</h2>
+      <div class="actions">
+        <button id="fail-save" type="button" disabled>Fail my next save before commit</button>
+        <button id="reset-v7" type="button">Reset fixtures to v7</button>
+      </div>
+      <p id="mentor-status" role="status" aria-live="polite">Local exercise controls. Reset replaces demo data and revokes all sessions.</p>
+    </section>
+    <!-- mentor-end -->
     <p id="notice" role="status" aria-live="polite">Loading editing space…</p>
     <div class="campaign-picker" id="picker" hidden><label for="campaign">Campaign</label><select id="campaign"></select></div>
     <article id="editor" hidden aria-labelledby="title">

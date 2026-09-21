@@ -27,6 +27,15 @@ function json(res: ServerResponse, status: number, value: unknown): void {
 }
 export function createApp(db: DatabaseSync, env: string | undefined) {
   const fixturesEnabled = isTestEnvironment(env);
+  const saveFailures = new Set<string>();
+  function authenticate(req: IncomingMessage) {
+    const token = req.headers.authorization?.match(/^Bearer ([a-f0-9]{64})$/)?.[1];
+    const tokenHash = token ? hash(token) : '';
+    const actor = db.prepare(`SELECT a.id, a.name FROM sessions s JOIN actors a ON a.id = s.actor_id
+      WHERE s.token_hash = ? AND s.expires_at > ?`).get(tokenHash, Date.now());
+    if (!actor || typeof actor.id !== 'string') throw new HttpError(401, 'Session expired. Sign in again; your text has been kept.');
+    return { id: actor.id, name: actor.name, tokenHash };
+  }
   return createServer(async (req, res) => {
     try {
       const path = new URL(req.url ?? '/', 'http://localhost').pathname;
@@ -50,11 +59,21 @@ export function createApp(db: DatabaseSync, env: string | undefined) {
           db.prepare('INSERT INTO sessions VALUES (?, ?, ?)').run(hash(token), input.actorId, Date.now() + 3600000);
           return json(res, 201, { token, expiresIn: 3600 });
         }
+        if (method === 'POST' && path === '/__test/save-failure') {
+          const actor = authenticate(req);
+          const input = await body(req);
+          only(input, ['campaignId']);
+          if (typeof input.campaignId !== 'string') throw new HttpError(400, 'campaignId is required');
+          access(db, actor.id, input.campaignId, 'save');
+          saveFailures.add(JSON.stringify([actor.tokenHash, input.campaignId]));
+          return json(res, 200, { armed: true, campaignId: input.campaignId });
+        }
         if (method === 'POST' && path === '/__test/fixtures') {
           const input = await body(req);
           only(input, ['scenario']);
-          if (input.scenario !== 'default' && input.scenario !== 'empty') throw new HttpError(400, 'Unknown scenario');
+          if (input.scenario !== 'default' && input.scenario !== 'empty' && input.scenario !== 'conflict-v7') throw new HttpError(400, 'Unknown scenario');
           seed(db, env, input.scenario);
+          saveFailures.clear();
           return json(res, 200, { scenario: input.scenario });
         }
         throw new HttpError(404, 'Not found');
@@ -68,16 +87,15 @@ export function createApp(db: DatabaseSync, env: string | undefined) {
         const [file, type] = assets[path];
         res.writeHead(200, { 'Content-Type': type, 'Cache-Control': 'no-cache',
           'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'" });
-        return res.end(readFileSync(new URL(`../public/${file}`, import.meta.url)));
+        let content = readFileSync(new URL(`../public/${file}`, import.meta.url), 'utf8');
+        if (!fixturesEnabled && file === 'index.html') content = content.replace(/<!-- mentor-start -->[\s\S]*?<!-- mentor-end -->/, '');
+        return res.end(content);
       }
       if (method === 'GET' && path === '/health') return json(res, 200, { status: 'ok' });
       const route = path.match(/^\/api\/campaigns\/([^/]+)(?:\/(review|publish|publications)(?:\/(\d+))?)?$/);
       if (path !== '/api/me' && path !== '/api/campaigns' && !route) throw new HttpError(404, 'Not found');
-      const token = req.headers.authorization?.match(/^Bearer ([a-f0-9]{64})$/)?.[1];
-      const actor = token ? db.prepare(`SELECT a.id, a.name FROM sessions s JOIN actors a ON a.id = s.actor_id
-        WHERE s.token_hash = ? AND s.expires_at > ?`).get(hash(token), Date.now()) : undefined;
-      if (!actor || typeof actor.id !== 'string') throw new HttpError(401, 'Session expired. Sign in again; your text has been kept.');
-      if (method === 'GET' && path === '/api/me') return json(res, 200, { ...actor,
+      const actor = authenticate(req);
+      if (method === 'GET' && path === '/api/me') return json(res, 200, { id: actor.id, name: actor.name,
         memberships: db.prepare('SELECT workspace_id, role FROM memberships WHERE actor_id = ?').all(actor.id) });
       if (method === 'GET' && path === '/api/campaigns') return json(res, 200,
         db.prepare('SELECT c.id, c.title, c.workspace_id FROM campaigns c JOIN memberships m ON m.workspace_id = c.workspace_id WHERE m.actor_id = ? ORDER BY c.id').all(actor.id));
@@ -86,7 +104,15 @@ export function createApp(db: DatabaseSync, env: string | undefined) {
         const action = route[2];
         access(db, actor.id, id);
         if (method === 'GET' && !action) return json(res, 200, detail(db, actor.id, id));
-        if (method === 'PUT' && !action) return json(res, 200, mutate(db, actor.id, id, 'save', await body(req)));
+        if (method === 'PUT' && !action) {
+          const failureKey = JSON.stringify([actor.tokenHash, id]);
+          const result = mutate(db, actor.id, id, 'save', await body(req), () => {
+            if (fixturesEnabled && saveFailures.delete(failureKey)) {
+              throw new HttpError(500, 'Nothing was saved; your input has been kept. Injected failure before commit. Try Save again.');
+            }
+          });
+          return json(res, 200, result);
+        }
         if (method === 'POST' && (action === 'review' || action === 'publish') && !route[3]) return json(res, 200, mutate(db, actor.id, id, action, await body(req)));
         if (method === 'GET' && action === 'publications' && route[3]) {
           const publication = db.prepare('SELECT * FROM publications WHERE campaign_id = ? AND id = ?').get(id, Number(route[3]));

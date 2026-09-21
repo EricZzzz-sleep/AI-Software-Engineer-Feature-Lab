@@ -15,7 +15,9 @@ function controls() {
   const editable = current && current.role !== 'viewer';
   const publisher = current?.role === 'publisher';
   fields.forEach(key => { $(key).readOnly = !editable || busy; });
-  $('save').disabled = !editable || !changed || busy || expired;
+  if ($('fail-save')) $('fail-save').disabled = !editable || busy || expired;
+  if ($('reset-v7')) $('reset-v7').disabled = busy;
+  $('save').disabled = !editable || busy || expired;
   $('generate-reason').textContent = changed ? 'Save your changes before generating' : 'Generation is not configured';
   $('review').disabled = !publisher || !!changed || busy || expired;
   $('publish').disabled = !publisher || !!changed || busy || expired || !current?.reviewed;
@@ -29,8 +31,14 @@ function controls() {
   document.querySelectorAll('#publication-list button').forEach(button => { button.disabled = busy; });
 }
 async function api(path, method = 'GET', data) {
-  const response = await fetch(path, { method, headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(data ? { 'Content-Type': 'application/json' } : {}) }, body: data ? JSON.stringify(data) : undefined });
-  const result = await response.json();
+  let response, result;
+  try {
+    response = await fetch(path, { method, headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(data ? { 'Content-Type': 'application/json' } : {}) }, body: data ? JSON.stringify(data) : undefined });
+    result = await response.json();
+  } catch (error) {
+    if (method === 'PUT') throw new Error('Save outcome unknown; the request may have succeeded. Your input has been kept. Reload saved content to confirm.');
+    throw error;
+  }
   if (!response.ok) {
     if (response.status === 401) { expired = true; $('signin').textContent = 'Sign in again'; controls(); }
     throw new Error(result.error || 'Request failed. Your text has been kept.');
@@ -136,7 +144,10 @@ fields.forEach(key => $(key).addEventListener('input', () => { controls(); annou
 $('save').onclick = async () => {
   busy = true; controls(); announce('Saving brief and draft…');
   try { render(await api(`/api/campaigns/${current.id}`, 'PUT', { expectedVersion: current.version, ...values() })); announce(`Saved version ${current.version}.`); }
-  catch (error) { announce(`Save failed. ${errorMessage(error)}`); }
+  catch (error) {
+    announce(error.message.startsWith('Save outcome unknown') ? error.message : `Save failed. ${errorMessage(error)}`);
+    if ($('mentor-status') && error.message.includes('Injected failure before commit')) $('mentor-status').textContent = 'The injected failure was consumed. Retry Save to persist your input.';
+  }
   finally { busy = false; controls(); }
 };
 $('reload').onclick = async () => {
@@ -167,6 +178,7 @@ async function initialize() {
     if (response.ok) {
       actorOptions = await response.json();
       $('session-bar').hidden = false;
+      if ($('mentor-drills')) $('mentor-drills').hidden = false;
       actorOptions.forEach(actor => $('actor').append(new Option(`${actor.name} / ${actor.role} · Workspace ${actor.workspaceId.toUpperCase()}`, actor.id)));
       $('actor').value = actorId;
     }
@@ -175,3 +187,27 @@ async function initialize() {
   } catch (error) { $('notice').textContent = errorMessage(error); }
 }
 initialize();
+
+if ($('fail-save')) $('fail-save').onclick = async () => {
+  busy = true; controls();
+  try {
+    await api('/__test/save-failure', 'POST', { campaignId: current.id });
+    $('mentor-status').textContent = 'Armed for this session and campaign: your next valid save will fail before commit. Invalid or conflicting saves do not consume it.';
+  } catch (error) { $('mentor-status').textContent = errorMessage(error); }
+  finally { busy = false; controls(); }
+};
+if ($('reset-v7')) $('reset-v7').onclick = async () => {
+  if (!await showDialog('Reset demo fixtures to v7?', 'This replaces all demo data, discards local edits in this tab, and revokes all sessions. Both tabs must sign in again and load v7 before the conflict drill.', '', 'Reset fixtures')) return;
+  busy = true; controls();
+  try {
+    await api('/__test/fixtures', 'POST', { scenario: 'conflict-v7' });
+    token = ''; actorId = ''; current = null; expired = false;
+    sessionStorage.removeItem('lab-token'); sessionStorage.removeItem('lab-actor');
+    fields.forEach(key => { $(key).value = ''; });
+    $('editor').hidden = true; $('picker').hidden = true; $('actor').value = '';
+    $('identity').textContent = ''; $('signin').textContent = 'Sign in';
+    $('notice').textContent = 'Fixtures reset to v7. Sign in again in both tabs to begin the drill.';
+    $('mentor-status').textContent = 'Reset complete. All armed failures and sessions were cleared.';
+  } catch (error) { $('mentor-status').textContent = errorMessage(error); }
+  finally { busy = false; controls(); }
+};
