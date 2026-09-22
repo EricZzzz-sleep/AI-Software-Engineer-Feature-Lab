@@ -3,7 +3,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { readFileSync } from 'node:fs';
 import type { DatabaseSync } from 'node:sqlite';
 import { actors, isTestEnvironment, seed } from './db.js';
-import { access, detail, HttpError, mutate, only } from './campaigns.js';
+import { access, detail, HttpError, mutate, only, versionHistory, versionDetail, reviewVersion } from './campaigns.js';
 
 const hash = (token: string) => createHash('sha256').update(token).digest('hex');
 async function body(req: IncomingMessage): Promise<Record<string, unknown>> {
@@ -92,9 +92,17 @@ export function createApp(db: DatabaseSync, env: string | undefined) {
         return res.end(content);
       }
       if (method === 'GET' && path === '/health') return json(res, 200, { status: 'ok' });
+      const versionRoute = path.match(/^\/api\/campaigns\/([^/]+)\/versions(?:\/(\d+)(\/review)?)?$/);
       const route = path.match(/^\/api\/campaigns\/([^/]+)(?:\/(review|publish|publications)(?:\/(\d+))?)?$/);
-      if (path !== '/api/me' && path !== '/api/campaigns' && !route) throw new HttpError(404, 'Not found');
+      if (path !== '/api/me' && path !== '/api/campaigns' && !route && !versionRoute) throw new HttpError(404, 'Not found');
       const actor = authenticate(req);
+      if (versionRoute) {
+        const [, id, version, review] = versionRoute;
+        if (method === 'GET' && !version) return json(res, 200, versionHistory(db, actor.id, id!));
+        if (method === 'GET' && version && !review) return json(res, 200, versionDetail(db, actor.id, id!, Number(version)));
+        if (method === 'POST' && version && review) return json(res, 200, reviewVersion(db, actor.id, id!, Number(version), await body(req)));
+        throw new HttpError(405, 'Method not allowed');
+      }
       if (method === 'GET' && path === '/api/me') return json(res, 200, { id: actor.id, name: actor.name,
         memberships: db.prepare('SELECT workspace_id, role FROM memberships WHERE actor_id = ?').all(actor.id) });
       if (method === 'GET' && path === '/api/campaigns') return json(res, 200,

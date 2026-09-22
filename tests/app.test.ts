@@ -274,3 +274,43 @@ test('armed failures are campaign-specific, apply to no-op saves, and clear on r
     assert.equal((await app.request('/api/campaigns/launch', 'PUT', { ...content, expectedVersion: 7 }, token)).status, 200);
   } finally { await app.close(); }
 });
+
+test('publishers can inspect and review any saved version without changing the current revision', async () => {
+  const app = await harness();
+  try {
+    seed(app.db, 'test', 'conflict-v7');
+    const token = await app.session('ren');
+    const req = (suffix: string, method = 'GET', data?: unknown, auth = token) => app.request('/api/campaigns/launch' + suffix, method, data, auth);
+    const versions = await (await req('/versions')).json();
+    assert.deepEqual(versions.map((v: { version: number }) => v.version), [7, 6, 5, 4, 3, 2, 1]);
+    const before = await (await req('')).json();
+    const older = await (await req('/versions/3')).json();
+    assert.equal(older.draft, 'Campaign draft revision 3.');
+    assert.equal((await req('/versions/3/review', 'POST', { role: 'publisher' })).status, 400);
+    const reviewed = await (await req('/versions/3/review', 'POST', {})).json();
+    assert.equal(reviewed.version, 3);
+    assert.equal(reviewed.reviewed, true);
+    assert.equal(reviewed.draft, older.draft);
+    assert.deepEqual(await (await req('')).json(), before);
+    assert.deepEqual(await (await req('/versions/3/review', 'POST', {})).json(), reviewed);
+    assert.equal(app.db.prepare('SELECT count(*) AS n FROM reviews').get()?.n, 1);
+    assert.equal((await req('/publish', 'POST', { expectedVersion: 7 })).status, 409);
+    // Review a snapshot even after another editor saves a newer version.
+    await req('', 'PUT', { ...content, expectedVersion: 7 });
+    assert.equal((await req('/versions/7/review', 'POST', {})).status, 200);
+    const latest = await (await req('')).json();
+    assert.equal(latest.version, 8);
+    assert.equal(latest.reviewed, false);
+    for (const actor of ['maya', 'evan', 'priya']) {
+      const auth = await app.session(actor);
+      for (const suffix of ['/versions', '/versions/3', '/versions/3/review']) {
+        assert.equal((await req(suffix, suffix.endsWith('/review') ? 'POST' : 'GET', suffix.endsWith('/review') ? {} : undefined, auth)).status, actor === 'priya' ? 404 : 403);
+      }
+    }
+    assert.equal((await app.request('/api/campaigns/launch/versions')).status, 401);
+    assert.equal((await req('/versions/999')).status, 404);
+    assert.equal((await req('/versions/999/review', 'POST', {})).status, 404);
+    assert.equal((await req('/versions/0')).status, 400);
+    assert.equal((await app.request('/api/campaigns/missing/versions', 'GET', undefined, token)).status, 404);
+  } finally { await app.close(); }
+});

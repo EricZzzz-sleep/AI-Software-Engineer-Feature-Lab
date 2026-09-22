@@ -275,3 +275,51 @@ test('lost response after commit is uncertain, preserves input, and stale retry 
   await expect(page.locator('#saved')).toHaveText('Saved v2');
   await expectBrief(page, 'committed');
 });
+
+test('Ren selects and reviews historical versions while preserving unsaved editor input', async ({ page, request }) => {
+  await request.post('/__test/fixtures', { data: { scenario: 'conflict-v7' } });
+  await login(page, 'ren');
+  await fillBrief(page, 'local input');
+  await page.getByRole('tab', { name: 'Review versions' }).click();
+  await expect(page.getByLabel('Version to review').locator('option')).toHaveCount(7);
+  await expect(page.locator('#version-preview')).toContainText('Campaign draft revision 7.');
+  await page.getByLabel('Version to review').selectOption('3');
+  await expect(page.locator('#version-preview')).toContainText('Campaign draft revision 3.');
+  await page.getByRole('button', { name: 'Review selected version' }).click();
+  await expect(page.locator('#dialog-title')).toHaveText('Review saved v3');
+  await page.getByRole('button', { name: 'Confirm review' }).click();
+  await expect(page.locator('#versions-status')).toHaveText('Version 3 reviewed.');
+  await expect(page.getByRole('button', { name: 'Review selected version' })).toBeDisabled();
+  await page.getByRole('tab', { name: 'Edit campaign' }).click();
+  await expectBrief(page, 'local input');
+  await expect(page.locator('#saved')).toHaveText('Unsaved · v7');
+  await page.locator('#reload').click(); await page.locator('#dialog-confirm').click();
+  await expect(page.locator('#publish')).toBeDisabled();
+  await page.getByRole('tab', { name: 'Review versions' }).click();
+  await page.getByLabel('Version to review').selectOption('3');
+  await expect(page.locator('#version-meta')).toContainText('Reviewed');
+  await page.getByLabel('Version to review').selectOption('7');
+  await expect(page.locator('#version-meta')).toContainText('Not reviewed');
+  await page.locator('#review-version').click(); await page.locator('#dialog-confirm').click();
+  await expect(page.locator('#versions-status')).toHaveText('Version 7 reviewed.');
+  await page.getByRole('tab', { name: 'Edit campaign' }).click();
+  await expect(page.locator('#publish')).toBeEnabled();
+  await page.getByLabel('Test session').selectOption('maya');
+  await expect(page.locator('#editor-tabs')).toBeHidden();
+});
+
+test('version review tabs support keyboard selection and failed loads cannot approve stale content', async ({ page }) => {
+  await login(page, 'ren');
+  await page.getByRole('tab', { name: 'Edit campaign' }).focus();
+  await page.keyboard.press('ArrowRight');
+  await expect(page.getByRole('tab', { name: 'Review versions' })).toHaveAttribute('aria-selected', 'true');
+  await expect(page.locator('#review-version')).toBeEnabled();
+  await page.getByRole('tab', { name: 'Review versions' }).focus();
+  await page.keyboard.press('Home');
+  await expect(page.getByRole('tab', { name: 'Edit campaign' })).toHaveAttribute('aria-selected', 'true');
+  await page.route('**/versions/1', route => route.fulfill({ status: 500, json: { error: 'Unable to load version' } }));
+  await page.getByRole('tab', { name: 'Review versions' }).click();
+  await expect(page.locator('#versions-status')).toHaveText('Unable to load version');
+  await expect(page.locator('#review-version')).toBeDisabled();
+  await expect(page.locator('#version-preview')).toBeEmpty();
+});

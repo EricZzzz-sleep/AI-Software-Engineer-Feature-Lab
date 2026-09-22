@@ -7,6 +7,7 @@ let current = null;
 let busy = false;
 let expired = false;
 let actorOptions = [];
+let selectedVersion = null;
 const values = () => Object.fromEntries(fields.map(key => [key, $(key).value]));
 const dirty = () => current && fields.some(key => $(key).value !== current[key]);
 function announce(message) { $('status').textContent = message; }
@@ -14,6 +15,9 @@ function controls() {
   const changed = dirty();
   const editable = current && current.role !== 'viewer';
   const publisher = current?.role === 'publisher';
+  $('editor-tabs').hidden = !publisher;
+  for (const id of ['edit-tab', 'versions-tab', 'version-select']) $(id).disabled = busy;
+  $('review-version').disabled = !publisher || busy || expired || !selectedVersion || selectedVersion.reviewed;
   fields.forEach(key => { $(key).readOnly = !editable || busy; });
   if ($('fail-save')) $('fail-save').disabled = !editable || busy || expired;
   if ($('reset-v7')) $('reset-v7').disabled = busy;
@@ -74,6 +78,8 @@ async function discardAllowed() {
 }
 function render(data) {
   current = data;
+  selectedVersion = null;
+  showEditorTab(false);
   fields.forEach(key => { $(key).value = data[key]; });
   $('title').textContent = `Campaign / ${data.title}`;
   $('editor').hidden = false;
@@ -210,4 +216,67 @@ if ($('reset-v7')) $('reset-v7').onclick = async () => {
     $('mentor-status').textContent = 'Reset complete. All armed failures and sessions were cleared.';
   } catch (error) { $('mentor-status').textContent = errorMessage(error); }
   finally { busy = false; controls(); }
+};
+
+function showEditorTab(history) {
+  $('edit-panel').hidden = history;
+  $('versions-panel').hidden = !history;
+  $('edit-tab').setAttribute('aria-selected', String(!history));
+  $('versions-tab').setAttribute('aria-selected', String(history));
+  $('edit-tab').tabIndex = history ? -1 : 0;
+  $('versions-tab').tabIndex = history ? 0 : -1;
+}
+function renderVersion(data) {
+  selectedVersion = data;
+  $('version-preview').textContent = preview(data);
+  $('version-meta').textContent = `Version ${data.version} · Saved by ${data.author} · ${data.saved_at} · ${data.reviewed ? 'Reviewed' : 'Not reviewed'}`;
+}
+async function loadSelectedVersion() {
+  selectedVersion = null;
+  $('version-preview').textContent = '';
+  $('version-meta').textContent = '';
+  const data = await api(`/api/campaigns/${current.id}/versions/${$('version-select').value}`);
+  renderVersion(data);
+}
+$('edit-tab').onclick = () => showEditorTab(false);
+$('versions-tab').onclick = async () => {
+  if (busy || current?.role !== 'publisher') return;
+  showEditorTab(true);
+  selectedVersion = null;
+  $('version-preview').textContent = ''; $('version-meta').textContent = '';
+  busy = true; controls(); $('versions-status').textContent = 'Loading saved versions…';
+  try {
+    const versions = await api(`/api/campaigns/${current.id}/versions`);
+    $('version-select').replaceChildren(...versions.map(v => new Option(`Version ${v.version}${v.reviewed ? ' · Reviewed' : ''}`, v.version)));
+    if (versions.length) await loadSelectedVersion();
+    $('versions-status').textContent = versions.length ? 'Choose a saved version to inspect and review. Your editor input is kept.' : 'No saved versions are available.';
+  } catch (error) { $('versions-status').textContent = errorMessage(error); }
+  finally { busy = false; controls(); }
+};
+$('version-select').onchange = async () => {
+  busy = true; controls();
+  try { await loadSelectedVersion(); $('versions-status').textContent = `Saved version ${selectedVersion.version} loaded.`; }
+  catch (error) { $('versions-status').textContent = errorMessage(error); }
+  finally { busy = false; controls(); }
+};
+$('review-version').onclick = async () => {
+  if ($('review-version').disabled) return;
+  const saved = selectedVersion;
+  const id = current.id;
+  if (!await showDialog(`Review saved v${saved.version}`, 'Review this saved brief and draft, then confirm approval of this version only.', preview(saved), 'Confirm review')) return;
+  busy = true; controls();
+  try {
+    const result = await api(`/api/campaigns/${id}/versions/${saved.version}/review`, 'POST', {});
+    renderVersion(result);
+    $('version-select').selectedOptions[0].textContent = `Version ${saved.version} · Reviewed`;
+    if (current.version === saved.version) current.reviewed = true;
+    $('versions-status').textContent = `Version ${saved.version} reviewed.`;
+  } catch (error) { $('versions-status').textContent = errorMessage(error); }
+  finally { busy = false; controls(); $('version-select').focus(); }
+};
+for (const id of ['edit-tab', 'versions-tab']) $(id).onkeydown = event => {
+  if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+  event.preventDefault();
+  const target = event.key === 'Home' ? 'edit-tab' : event.key === 'End' ? 'versions-tab' : id === 'edit-tab' ? 'versions-tab' : 'edit-tab';
+  if (!$(target).disabled) { $(target).focus(); $(target).click(); }
 };

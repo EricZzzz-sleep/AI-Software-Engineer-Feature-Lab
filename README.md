@@ -195,3 +195,22 @@ Run `npm test` and `npm run test:browser` for rollback, persistence across datab
 reopening, v7 concurrent API saves, both two-tab combinations, fixture reset,
 permission enforcement, and lost-response coverage. Also run `npm run typecheck`,
 `npm run lint`, and `npm run build` before mentor review.
+
+### Reviewing saved versions
+
+Publishers such as Ren have **Edit campaign** and **Review versions** tabs. The
+review tab lists all saved revisions, newest first, with review indicators. Choose
+a revision to inspect its read-only brief/draft, author, and save time, then select
+**Review selected version** and confirm. Approval applies only to that revision;
+reviewing an older version never approves or replaces the current revision.
+Switching tabs preserves unsaved editor input. Publishing continues to require
+review of the current saved revision.
+
+Publisher-only, workspace-scoped endpoints:
+
+- `GET /api/campaigns/:id/versions`: version summaries, newest first.
+- `GET /api/campaigns/:id/versions/:version`: immutable saved content and review state.
+- `POST /api/campaigns/:id/versions/:version/review` with `{}`: idempotently approve
+  that exact saved revision, even if a newer revision has since been saved.
+
+The existing current-version review endpoint retains its stale-version check.

@@ -62,3 +62,31 @@ export function mutate(db: DatabaseSync, actorId: string, id: string, action: 's
     return result;
   } catch (error) { db.exec('ROLLBACK'); throw error; }
 }
+
+
+export function versionHistory(db: DatabaseSync, actorId: string, id: string) {
+  access(db, actorId, id, 'publish');
+  return db.prepare(`SELECT v.version, v.saved_at, a.name AS saved_by,
+    EXISTS(SELECT 1 FROM reviews r WHERE r.campaign_id = v.campaign_id AND r.version = v.version) AS reviewed
+    FROM campaign_versions v JOIN actors a ON a.id = v.saved_by
+    WHERE v.campaign_id = ? ORDER BY v.version DESC`).all(id);
+}
+export function versionDetail(db: DatabaseSync, actorId: string, id: string, version: number) {
+  access(db, actorId, id, 'publish');
+  if (!Number.isSafeInteger(version) || version < 1) throw new HttpError(400, 'A valid version is required');
+  const saved = db.prepare(`SELECT v.*, a.name AS author FROM campaign_versions v
+    JOIN actors a ON a.id = v.saved_by WHERE v.campaign_id = ? AND v.version = ?`).get(id, version);
+  if (!saved) throw new HttpError(404, 'Saved version not found');
+  return { ...saved, version, reviewed: !!db.prepare('SELECT 1 FROM reviews WHERE campaign_id = ? AND version = ?').get(id, version) };
+}
+export function reviewVersion(db: DatabaseSync, actorId: string, id: string, version: number, input: Record<string, unknown>) {
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    versionDetail(db, actorId, id, version);
+    only(input, []);
+    db.prepare('INSERT OR IGNORE INTO reviews (campaign_id, version, actor_id) VALUES (?, ?, ?)').run(id, version, actorId);
+    const result = versionDetail(db, actorId, id, version);
+    db.exec('COMMIT');
+    return result;
+  } catch (error) { db.exec('ROLLBACK'); throw error; }
+}
