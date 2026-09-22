@@ -16,8 +16,8 @@ test('explicit save, dirty explanations and failed save preserve text', async ({
   await expect(page.locator('#generate-reason')).toContainText('Generate from the saved brief');
   await page.getByLabel('Draft text').fill('Local draft to preserve');
   await expect(page.locator('#generate-reason')).toContainText('Generate from the saved brief');
-  await page.route('**/api/campaigns/launch', route => route.request().method() === 'PUT'
-    ? route.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ error: 'Temporary save failure. Your text has been kept.' }) }) : route.continue());
+  await page.locator('#fail-save').click();
+  await expect(page.locator('#mentor-status')).toContainText('Armed');
   await page.getByRole('button', { name: 'Save', exact: true }).click();
   await expect(page.locator('#status')).toContainText('Save failed');
   await expect(page.getByLabel('Draft text')).toHaveValue('Local draft to preserve');
@@ -348,4 +348,101 @@ test('timeout exhausts exactly two attempts and preserves saved draft', async ({
   await expect(page.locator('#generation-status')).toContainText('Generation failed · Attempt 2/2', { timeout: 10000 });
   await expect(page.getByLabel('Draft text')).toHaveValue(original);
   await expect(page.locator('#saved')).toHaveText('Saved v1');
+});
+
+test('all input survives pre-commit failure; retry and refresh restore the saved revision', async ({ page }) => {
+  await login(page);
+  await expect(page.locator('#save')).toBeEnabled();
+  await page.locator('#save').click();
+  await expect(page.locator('#status')).toHaveText('Saved version 1.');
+  await fillBrief(page, 'preserved');
+  await page.locator('#fail-save').click();
+  await expect(page.locator('#mentor-status')).toContainText('Armed');
+  await page.locator('#save').click();
+  await expect(page.locator('#status')).toContainText('Nothing was saved');
+  await expectBrief(page, 'preserved');
+  await expect(page.locator('#saved')).toHaveText('Unsaved · v1');
+  await page.locator('#save').click();
+  await expect(page.locator('#saved')).toHaveText('Saved v2');
+  await page.reload();
+  await expectBrief(page, 'preserved');
+  await expect(page.locator('#saved')).toHaveText('Saved v2');
+});
+
+for (const firstActor of ['maya', 'ren']) test(`two tabs from v7 conflict without losing input (${firstActor} and ren)`, async ({ browser, request }) => {
+  await request.post('/__test/fixtures', { data: { scenario: 'conflict-v7' } });
+  const firstContext = await browser.newContext();
+  const secondContext = await browser.newContext();
+  const first = await firstContext.newPage();
+  const second = await secondContext.newPage();
+  try {
+    await login(first, firstActor); await login(second, 'ren');
+    await expect(first.locator('#saved')).toHaveText('Saved v7');
+    await expect(second.locator('#saved')).toHaveText('Saved v7');
+    await fillBrief(first, 'first'); await fillBrief(second, 'second');
+    const responses = await Promise.all([
+      first.waitForResponse(r => r.request().method() === 'PUT'),
+      second.waitForResponse(r => r.request().method() === 'PUT'),
+      first.locator('#save').click(), second.locator('#save').click(),
+    ]);
+    const statuses = [responses[0].status(), responses[1].status()];
+    expect([...statuses].sort()).toEqual([200, 409]);
+    const winner = statuses[0] === 200 ? first : second;
+    const loser = winner === first ? second : first;
+    const winnerText = winner === first ? 'first' : 'second';
+    await expect(winner.locator('#saved')).toHaveText('Saved v8');
+    await expect(loser.locator('#saved')).toHaveText('Unsaved · v7');
+    await expect(loser.locator('#status')).toContainText('changed on the server');
+    await expectBrief(loser, loser === first ? 'first' : 'second');
+    await loser.locator('#reload').click();
+    await loser.locator('#dialog-cancel').click();
+    await expectBrief(loser, loser === first ? 'first' : 'second');
+    await loser.locator('#reload').click();
+    await loser.locator('#dialog-confirm').click();
+    await expectBrief(loser, winnerText);
+    await expect(loser.locator('#saved')).toHaveText('Saved v8');
+  } finally { await firstContext.close(); await secondContext.close(); }
+});
+
+test('mentor reset confirms destructive changes and requires sign-in at v7', async ({ page, request }) => {
+  await login(page);
+  const oldToken = await page.evaluate(() => sessionStorage.getItem('lab-token'));
+  await fillBrief(page, 'unsaved');
+  await page.locator('#reset-v7').click();
+  await expect(page.locator('#dialog-description')).toContainText('revokes all sessions');
+  await page.locator('#dialog-cancel').click();
+  await expectBrief(page, 'unsaved');
+  await page.locator('#reset-v7').click();
+  await page.locator('#dialog-confirm').click();
+  await expect(page.locator('#editor')).toBeHidden();
+  expect((await request.get('/api/me', { headers: { Authorization: `Bearer ${oldToken}` } })).status()).toBe(401);
+  await page.getByLabel('Test session').selectOption('maya');
+  await expect(page.locator('#saved')).toHaveText('Saved v7');
+});
+
+test('lost response after commit is uncertain, preserves input, and stale retry conflicts', async ({ page, request }) => {
+  await login(page);
+  const token = await page.evaluate(() => sessionStorage.getItem('lab-token'));
+  await fillBrief(page, 'committed');
+  await page.route('**/api/campaigns/launch', async route => {
+    if (route.request().method() !== 'PUT') return route.continue();
+    const response = await route.fetch();
+    expect(response.status()).toBe(200);
+    await route.abort('failed');
+  });
+  await page.locator('#save').click();
+  await expect(page.locator('#status')).toContainText('Save outcome unknown; the request may have succeeded.');
+  await expect(page.locator('#status')).not.toContainText('Nothing was saved');
+  await expectBrief(page, 'committed');
+  const saved = await (await request.get('/api/campaigns/launch', { headers: { Authorization: `Bearer ${token}` } })).json();
+  expect(saved.version).toBe(2);
+  for (const key of briefFields) expect(saved[key]).toBe(`${key} committed`);
+  await page.unroute('**/api/campaigns/launch');
+  await page.locator('#save').click();
+  await expect(page.locator('#status')).toContainText('changed on the server');
+  await expectBrief(page, 'committed');
+  await page.locator('#reload').click();
+  await page.locator('#dialog-confirm').click();
+  await expect(page.locator('#saved')).toHaveText('Saved v2');
+  await expectBrief(page, 'committed');
 });

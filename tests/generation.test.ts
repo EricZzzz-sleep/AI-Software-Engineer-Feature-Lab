@@ -277,3 +277,32 @@ test('a killed worker process is replaced and its leased job completes exactly o
     db.close(); rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test('v7 reset and injected save rollback preserve F2 revision guards', () => {
+  const db = fixture();
+  try {
+    queue(db, 'delayed_success');
+    const oldClaim = claimWork(db, 0, timing)!;
+    seed(db, 'test', 'conflict-v7');
+    assert.equal(saved(db).version, 7);
+    assert.equal(saved(db).brief_revision, 7);
+    assert.equal(saved(db).draft_revision, 7);
+    assert.equal(saved(db).active_generation_id, null);
+    assert.equal(db.prepare('SELECT count(*) AS n FROM generation_outbox').get()?.n, 0);
+    assert.equal(completeWork(db, oldClaim, { output: { draft: 'Pre-reset output' } }, 1, timing), false);
+    const job = enqueue(db, 'maya', 'launch', request('v7-generation', 7, 7), 1).job;
+    const before = saved(db);
+    assert.throws(() => mutate(db, 'maya', 'launch', 'save', {
+      goal: 'Rolled-back brief', facts: before.facts, tone: before.tone,
+      draft: 'Rolled-back draft', expectedVersion: 7,
+    }, () => { throw new Error('Injected before commit'); }), /Injected/);
+    assert.deepEqual(saved(db), before);
+    const claim = claimWork(db, 1, timing)!;
+    completeWork(db, claim, { output: { draft: 'Generated from v7' } }, 2, timing);
+    assert.equal(readJob(db, job.id)?.status, 'succeeded');
+    assert.equal(saved(db).version, 8);
+    assert.equal(saved(db).brief_revision, 7);
+    assert.equal(saved(db).draft_revision, 8);
+    assert.equal(saved(db).draft, 'Generated from v7');
+  } finally { db.close(); }
+});

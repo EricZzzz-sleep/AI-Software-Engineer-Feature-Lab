@@ -23,7 +23,7 @@ export function detail(db: DatabaseSync, actorId: string, id: string) {
     publications: db.prepare('SELECT id, version, published_at FROM publications WHERE campaign_id = ? ORDER BY id DESC').all(id),
   };
 }
-export function mutate(db: DatabaseSync, actorId: string, id: string, action: 'save' | 'review' | 'publish', input: Record<string, unknown>) {
+export function mutate(db: DatabaseSync, actorId: string, id: string, action: 'save' | 'review' | 'publish', input: Record<string, unknown>, beforeSaveCommit?: () => void) {
   db.exec('BEGIN IMMEDIATE');
   try {
     const campaign = access(db, actorId, id, action === 'save' ? 'save' : 'publish');
@@ -57,6 +57,7 @@ export function mutate(db: DatabaseSync, actorId: string, id: string, action: 's
     const result = action === 'publish'
       ? db.prepare('SELECT * FROM publications WHERE campaign_id = ? AND version = ?').get(id, Number(campaign.version))
       : detail(db, actorId, id);
+    if (action === 'save') beforeSaveCommit?.();
     db.exec('COMMIT');
     return result;
   } catch (error) { db.exec('ROLLBACK'); throw error; }

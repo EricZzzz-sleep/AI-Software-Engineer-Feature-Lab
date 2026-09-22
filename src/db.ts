@@ -40,7 +40,7 @@ export function migrate(db: DatabaseSync): void {
   }
 }
 
-export function seed(db: DatabaseSync, env: string | undefined, scenario: 'default' | 'empty' = 'default'): void {
+export function seed(db: DatabaseSync, env: string | undefined, scenario: 'default' | 'empty' | 'conflict-v7' = 'default'): void {
   if (!isTestEnvironment(env)) throw new Error('Fixtures require NODE_ENV=development or test');
   db.exec('BEGIN IMMEDIATE');
   try {
@@ -53,7 +53,7 @@ export function seed(db: DatabaseSync, env: string | undefined, scenario: 'defau
       db.prepare('INSERT INTO actors (id, name, role) VALUES (?, ?, ?)').run(actor.id, actor.name, 'member');
       db.prepare('INSERT INTO memberships VALUES (?, ?, ?)').run(actor.id, actor.workspaceId, actor.role);
     }
-    if (scenario === 'default') {
+    if (scenario !== 'empty') {
       for (const [id, workspace, title, owner] of [
         ['launch', 'a', 'Team scheduling launch', 'maya'],
         ['workspace-b', 'b', 'Workspace B campaign', 'priya'],
@@ -62,6 +62,14 @@ export function seed(db: DatabaseSync, env: string | undefined, scenario: 'defau
         db.prepare('INSERT INTO campaign_versions (campaign_id, version, goal, facts, tone, draft, saved_by) VALUES (?, 1, ?, ?, ?, ?, ?)')
           .run(id, 'Introduce team scheduling to busy team leads.', 'Shared availability. Fewer scheduling messages.', 'Clear and friendly', 'Bring your team together with simpler scheduling.', owner);
       }
+    }
+    if (scenario === 'conflict-v7') {
+      for (let version = 2; version <= 7; version++) {
+        db.prepare(`INSERT INTO campaign_versions (campaign_id, version, goal, facts, tone, draft, saved_by)
+          VALUES ('launch', ?, ?, ?, 'Clear and friendly', ?, 'maya')`)
+          .run(version, `Team scheduling campaign brief revision ${version}.`, 'Shared availability. Fewer scheduling messages.', `Campaign draft revision ${version}.`);
+      }
+      db.prepare("UPDATE campaigns SET version = 7 WHERE id = 'launch'").run();
     }
     db.exec('COMMIT');
   } catch (error) {

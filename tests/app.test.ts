@@ -4,9 +4,10 @@ import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { once } from 'node:events';
+import { request as httpRequest } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { DatabaseSync } from 'node:sqlite';
-import { mutate } from '../src/campaigns.js';
+import { mutate, detail } from '../src/campaigns.js';
 import { createApp } from '../src/app.js';
 import { actors, openDatabase, seed } from '../src/db.js';
 
@@ -243,4 +244,138 @@ test('different-key race still creates one active job; production fake controls 
       for (const name of ['generation-scenario', 'generation-release']) assert.equal((await app.request('/__test/' + name, 'POST', {})).status, 404);
     } finally { await app.close(); }
   }
+});
+
+test('one-shot pre-commit failure rolls back all writes and is scoped to the session', async () => {
+  const app = await harness();
+  try {
+    const token = await app.session('ren');
+    const otherSession = await app.session('ren');
+    const req = (path: string, method = 'GET', data?: unknown, session = token) => app.request(path, method, data, session);
+    const campaign = '/api/campaigns/launch';
+    await req(campaign + '/review', 'POST', { expectedVersion: 1 });
+    const before = await (await req(campaign)).json();
+    assert.equal((await req('/__test/save-failure', 'POST', { campaignId: 'launch' })).status, 200);
+    assert.equal((await req(campaign, 'PUT', { ...content, expectedVersion: 0 })).status, 400);
+    assert.equal((await req(campaign, 'PUT', { ...content, expectedVersion: 2 })).status, 409);
+    // A no-op from a different session must neither fail nor consume this session's injection.
+    const unchanged = { goal: before.goal, facts: before.facts, tone: before.tone, draft: before.draft, expectedVersion: 1 };
+    assert.equal((await req(campaign, 'PUT', unchanged, otherSession)).status, 200);
+    // A rejected save after role revocation must also leave the injection armed.
+    app.db.exec("UPDATE memberships SET role = 'viewer' WHERE actor_id = 'ren'");
+    assert.equal((await req(campaign, 'PUT', { ...content, expectedVersion: 1 })).status, 403);
+    app.db.exec("UPDATE memberships SET role = 'publisher' WHERE actor_id = 'ren'");
+    const failed = await req(campaign, 'PUT', { ...content, expectedVersion: 1 });
+    assert.equal(failed.status, 500);
+    assert.match((await failed.json()).error, /Nothing was saved/);
+    assert.deepEqual(await (await req(campaign)).json(), before);
+    assert.equal(app.db.prepare("SELECT count(*) AS n FROM campaign_versions WHERE campaign_id = 'launch'").get()?.n, 1);
+    assert.equal(app.db.prepare('SELECT count(*) AS n FROM reviews').get()?.n, 1);
+    const saved = await (await req(campaign, 'PUT', { ...content, expectedVersion: 1 })).json();
+    assert.equal(saved.version, 2);
+    assert.equal(saved.reviewed, false);
+    assert.equal(saved.draft, content.draft);
+  } finally { await app.close(); }
+});
+
+test('failure controls enforce authentication, workspace, fields, origin, and environment', async () => {
+  const app = await harness();
+  try {
+    const path = '/__test/save-failure';
+    assert.equal((await app.request(path, 'POST', { campaignId: 'launch' })).status, 401);
+    for (const [actor, status] of [['maya', 200], ['ren', 200], ['evan', 403], ['priya', 404]] as const) {
+      assert.equal((await app.request(path, 'POST', { campaignId: 'launch' }, await app.session(actor))).status, status);
+    }
+    const token = await app.session('maya');
+    for (const input of [{}, { campaignId: 'launch', role: 'publisher' }]) assert.equal((await app.request(path, 'POST', input, token)).status, 400);
+    assert.equal((await app.request(path, 'POST', { campaignId: 'missing' }, token)).status, 404);
+    assert.equal((await app.request(path, 'POST', { campaignId: 'launch' }, token, { Origin: 'https://example.com' })).status, 403);
+    const foreignHostStatus = await new Promise<number | undefined>((resolve, reject) => {
+      const request = httpRequest(app.url + path, { method: 'POST', headers: { Host: 'example.com', Authorization: `Bearer ${token}` } }, response => {
+        response.resume(); resolve(response.statusCode);
+      });
+      request.on('error', reject);
+      request.end(JSON.stringify({ campaignId: 'launch' }));
+    });
+    assert.equal(foreignHostStatus, 403);
+    app.db.exec('UPDATE sessions SET expires_at = 0');
+    assert.equal((await app.request(path, 'POST', { campaignId: 'launch' }, token)).status, 401);
+  } finally { await app.close(); }
+  for (const env of ['production', 'staging', '']) {
+    const locked = await harness(env);
+    try {
+      assert.equal((await locked.request('/__test/save-failure', 'POST', { campaignId: 'launch' })).status, 404);
+      assert.doesNotMatch(await (await locked.request('/')).text(), /id="mentor-drills"/);
+    } finally { await locked.close(); }
+  }
+});
+
+for (const editor of ['maya', 'ren']) test(`v7 simultaneous saves (${editor} and ren) have exactly one winner`, async () => {
+  const app = await harness();
+  try {
+    const oldToken = await app.session('maya');
+    await app.request('/__test/save-failure', 'POST', { campaignId: 'launch' }, oldToken);
+    assert.equal((await app.request('/__test/fixtures', 'POST', { scenario: 'conflict-v7' })).status, 200);
+    assert.equal((await app.request('/api/me', 'GET', undefined, oldToken)).status, 401);
+    const tokens = [await app.session(editor), await app.session('ren')];
+    assert.equal(app.db.prepare("SELECT count(*) AS n FROM campaign_versions WHERE campaign_id = 'launch'").get()?.n, 7);
+    assert.equal(app.db.prepare('SELECT count(*) AS n FROM reviews').get()?.n, 0);
+    assert.equal(app.db.prepare('SELECT count(*) AS n FROM publications').get()?.n, 0);
+    const responses = await Promise.all(tokens.map((token, i) => app.request('/api/campaigns/launch', 'PUT', { ...content, draft: `Tab ${i}`, expectedVersion: 7 }, token)));
+    assert.deepEqual(responses.map(r => r.status).sort(), [200, 409]);
+    const winner = responses.findIndex(r => r.status === 200);
+    const saved = await (await app.request('/api/campaigns/launch', 'GET', undefined, tokens[0])).json();
+    assert.equal(saved.version, 8);
+    assert.equal(saved.draft, `Tab ${winner}`);
+    assert.equal(app.db.prepare("SELECT count(*) AS n FROM campaign_versions WHERE campaign_id = 'launch'").get()?.n, 8);
+  } finally { await app.close(); }
+});
+
+
+test('saved brief and revision persist after reopening the database', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'campaign-save-'));
+  const path = join(directory, 'lab.sqlite');
+  try {
+    let db = openDatabase(path);
+    seed(db, 'test', 'conflict-v7');
+    mutate(db, 'maya', 'launch', 'save', { ...content, expectedVersion: 7 });
+    db.close();
+    db = openDatabase(path);
+    const saved: Record<string, unknown> = detail(db, 'maya', 'launch');
+    for (const [key, value] of Object.entries(content)) assert.equal(saved[key], value);
+    assert.equal(saved.version, 8);
+    db.close();
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('armed failures are campaign-specific, apply to no-op saves, and clear on reset or restart', async () => {
+  const app = await harness();
+  try {
+    const token = await app.session('maya');
+    app.db.exec("INSERT INTO campaigns (id, workspace_id, title, version) VALUES ('other', 'a', 'Other campaign', 1); INSERT INTO campaign_versions (campaign_id, version, goal, facts, tone, draft, saved_by) VALUES ('other', 1, '', '', '', '', 'maya')");
+    const arm = () => app.request('/__test/save-failure', 'POST', { campaignId: 'launch' }, token);
+    await arm();
+    assert.equal((await app.request('/api/campaigns/other', 'PUT', { ...content, expectedVersion: 1 }, token)).status, 200);
+    const saved = await (await app.request('/api/campaigns/launch', 'GET', undefined, token)).json();
+    const noOp = { expectedVersion: 1, goal: saved.goal, facts: saved.facts, tone: saved.tone, draft: saved.draft };
+    assert.equal((await app.request('/api/campaigns/launch', 'PUT', noOp, token)).status, 500);
+    assert.equal((await app.request('/api/campaigns/launch', 'PUT', noOp, token)).status, 200);
+    await arm();
+    // A new server instance on the same database has no in-memory failure state.
+    const restarted = createApp(app.db, 'test');
+    restarted.listen(0, '127.0.0.1');
+    await once(restarted, 'listening');
+    try {
+      const response = await fetch(`http://127.0.0.1:${(restarted.address() as AddressInfo).port}/api/campaigns/launch`, {
+        method: 'PUT', headers: { Authorization: `Bearer ${token}` }, body: JSON.stringify(noOp),
+      });
+      assert.equal(response.status, 200);
+    } finally { await new Promise<void>(resolve => restarted.close(() => resolve())); }
+    // Restore the exact old session after resetting to prove the failure set was cleared,
+    // independently of reset's normal session revocation.
+    const session = app.db.prepare('SELECT * FROM sessions').get()!;
+    await app.request('/__test/fixtures', 'POST', { scenario: 'conflict-v7' });
+    app.db.prepare('INSERT INTO sessions VALUES (?, ?, ?)').run(session.token_hash!, session.actor_id!, session.expires_at!);
+    assert.equal((await app.request('/api/campaigns/launch', 'PUT', { ...content, expectedVersion: 7 }, token)).status, 200);
+  } finally { await app.close(); }
 });
