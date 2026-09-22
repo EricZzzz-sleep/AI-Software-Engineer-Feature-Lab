@@ -7,14 +7,13 @@ import { once } from 'node:events';
 import type { AddressInfo } from 'node:net';
 import { DatabaseSync } from 'node:sqlite';
 import { mutate } from '../src/campaigns.js';
-import { type DraftGenerator } from '../src/generation.js';
 import { createApp } from '../src/app.js';
 import { actors, openDatabase, seed } from '../src/db.js';
 
-async function harness(env = 'test', generator: DraftGenerator | null = null) {
+async function harness(env = 'test') {
   const db = openDatabase(':memory:');
   seed(db, 'test');
-  const server = createApp(db, env, generator);
+  const server = createApp(db, env);
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
   const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
@@ -136,86 +135,11 @@ test('forward migration preserves legacy data; campaign versions survive reopeni
     db.close();
     db = openDatabase(path);
     assert.equal(db.prepare('SELECT count(*) AS n FROM campaigns').get()?.n, 2);
-    assert.equal(db.prepare('SELECT count(*) AS n FROM migrations').get()?.n, 2);
+    assert.equal(db.prepare('SELECT count(*) AS n FROM migrations').get()?.n, 3);
     db.close();
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
 
-
-test('generation uses saved brief, enforces permissions, and leaves saved content unchanged', async () => {
-  const briefs: unknown[] = [];
-  const app = await harness('test', async brief => { briefs.push(brief); return 'Generated copy'; });
-  try {
-    const token = await app.session('maya');
-    const path = '/api/campaigns/launch/generate';
-    assert.equal((await app.request(path, 'POST', { expectedVersion: 1 })).status, 401);
-    for (const [actor, status] of [['evan', 403], ['priya', 404]] as const) {
-      assert.equal((await app.request(path, 'POST', { expectedVersion: 1 }, await app.session(actor))).status, status);
-    }
-    for (const data of [{ expectedVersion: 0 }, { expectedVersion: 1, goal: 'Forged' }]) {
-      assert.equal((await app.request(path, 'POST', data, token)).status, 400);
-    }
-    assert.equal((await app.request(path, 'POST', { expectedVersion: 2 }, token)).status, 409);
-    assert.equal(briefs.length, 0);
-    const before = await (await app.request('/api/campaigns/launch', 'GET', undefined, token)).json();
-    assert.deepEqual(await (await app.request(path, 'POST', { expectedVersion: 1 }, token)).json(), { draft: 'Generated copy', expectedVersion: 1 });
-    assert.deepEqual(briefs, [{ goal: before.goal, facts: before.facts, tone: before.tone }]);
-    assert.deepEqual(await (await app.request('/api/campaigns/launch', 'GET', undefined, token)).json(), before);
-    await app.request('/api/campaigns/launch', 'PUT', { ...content, goal: '  ', expectedVersion: 1 }, token);
-    assert.equal((await app.request(path, 'POST', { expectedVersion: 2 }, token)).status, 400);
-  } finally { await app.close(); }
-});
-
-test('generation rejects duplicates and stale results, then releases the campaign lock', async () => {
-  let finish!: (draft: string) => void;
-  let started!: () => void;
-  const pending = new Promise<void>(resolve => { started = resolve; });
-  const app = await harness('test', () => { started(); return new Promise(resolve => { finish = resolve; }); });
-  try {
-    const token = await app.session('maya');
-    const path = '/api/campaigns/launch/generate';
-    const generation = app.request(path, 'POST', { expectedVersion: 1 }, token);
-    await pending;
-    assert.equal((await app.request(path, 'POST', { expectedVersion: 1 }, token)).status, 409);
-    await app.request('/api/campaigns/launch', 'PUT', { ...content, expectedVersion: 1 }, token);
-    finish('Obsolete output');
-    assert.equal((await generation).status, 409);
-    const saved = await (await app.request('/api/campaigns/launch', 'GET', undefined, token)).json();
-    assert.equal(saved.draft, content.draft);
-  } finally { await app.close(); }
-});
-
-test('missing generation configuration returns an actionable error', async () => {
-  const app = await harness();
-  try {
-    const response = await app.request('/api/campaigns/launch/generate', 'POST', { expectedVersion: 1 }, await app.session('maya'));
-    assert.equal(response.status, 503);
-    assert.match((await response.json()).error, /OPENAI_API_KEY/);
-  } finally { await app.close(); }
-});
-
-test('generation accepts local brief variations and allows saving that brief during the request', async () => {
-  let finish!: (draft: string) => void;
-  let start!: () => void;
-  const started = new Promise<void>(resolve => { start = resolve; });
-  const brief = { goal: 'Local goal', facts: 'Local facts', tone: 'Warm', previousDraft: 'Previous variation' };
-  const app = await harness('test', input => {
-    assert.deepEqual(input, brief);
-    start();
-    return new Promise(resolve => { finish = resolve; });
-  });
-  try {
-    const token = await app.session('maya');
-    const generation = app.request('/api/campaigns/launch/generate', 'POST', { expectedVersion: 1, ...brief }, token);
-    await started;
-    assert.equal((await app.request('/api/campaigns/launch', 'PUT', { expectedVersion: 1, goal: brief.goal, facts: brief.facts, tone: brief.tone, draft: brief.previousDraft }, token)).status, 200);
-    finish('Next variation');
-    assert.equal((await generation).status, 200);
-    const saved = await (await app.request('/api/campaigns/launch', 'GET', undefined, token)).json();
-    assert.equal(saved.draft, brief.previousDraft);
-    assert.equal(saved.version, 2);
-  } finally { await app.close(); }
-});
 
 test('publishers can inspect and review any saved version without changing the current revision', async () => {
   const app = await harness();
@@ -255,4 +179,68 @@ test('publishers can inspect and review any saved version without changing the c
     assert.equal((await req('/versions/0')).status, 400);
     assert.equal((await app.request('/api/campaigns/missing/versions', 'GET', undefined, token)).status, 404);
   } finally { await app.close(); }
+});
+
+test('racing generation requests return one durable job, and status/result access is authorized', async () => {
+  const app = await harness();
+  try {
+    const maya = await app.session('maya');
+    const ren = await app.session('ren');
+    const input = { key: 'logical-request', briefRevision: 1, draftRevision: 1 };
+    const path = '/api/campaigns/launch/generate';
+    const responses = await Promise.all(Array.from({ length: 8 }, (_, i) => app.request(path, 'POST', input, i % 2 ? maya : ren)));
+    assert.equal(responses.filter(r => r.status === 202).length, 1);
+    assert.equal(responses.filter(r => r.status === 200).length, 7);
+    const results = await Promise.all(responses.map(r => r.json()));
+    assert.equal(new Set(results.map(j => j.id)).size, 1);
+    const id = results[0].id;
+    assert.equal(app.db.prepare('SELECT count(*) AS n FROM generation_outbox').get()?.n, 1);
+    const conflict = await app.request(path, 'POST', { ...input, key: 'other-request' }, maya);
+    assert.equal(conflict.status, 409); assert.equal((await conflict.json()).activeJobId, id);
+    assert.equal((await app.request(path, 'POST', { ...input, draftRevision: 2 }, maya)).status, 409);
+    assert.equal((await app.request(path, 'POST', { ...input, scenario: 'success' }, maya)).status, 400);
+    const evan = await app.session('evan'); const priya = await app.session('priya');
+    assert.equal((await app.request(path, 'POST', input, evan)).status, 403);
+    for (const suffix of ['', '/' + id]) {
+      const url = '/api/campaigns/launch/generations' + suffix;
+      assert.equal((await app.request(url)).status, 401);
+      assert.equal((await app.request(url, 'GET', undefined, evan)).status, 200);
+      assert.equal((await app.request(url, 'GET', undefined, priya)).status, 404);
+    }
+    assert.equal((await app.request('/api/campaigns/workspace-b/generations/' + id, 'GET', undefined, priya)).status, 404);
+    for (const [url, data] of [
+      ['/__test/generation-scenario', { campaignId: 'launch', scenario: 'delayed_success' }],
+      ['/__test/generation-release', { campaignId: 'launch', jobId: id }],
+    ] as const) {
+      assert.equal((await app.request(url, 'POST', data)).status, 401);
+      assert.equal((await app.request(url, 'POST', data, evan)).status, 403);
+      assert.equal((await app.request(url, 'POST', data, priya)).status, 404);
+      assert.equal((await app.request(url, 'POST', data, maya, { Origin: 'https://example.com' })).status, 403);
+      assert.equal((await app.request(url, 'POST', data, maya)).status, 200);
+    }
+    // Complete the original immutable scenario; another scenario setting cannot change the queued job.
+    const { runOnce } = await import('../src/worker.js');
+    await runOnce(app.db);
+    const completed = await (await app.request('/api/campaigns/launch/generations/' + id, 'GET', undefined, maya)).json();
+    assert.equal(completed.status, 'succeeded'); assert.match(completed.draft, /Shared availability/);
+    assert.equal((await app.request('/api/campaigns/launch/generations/' + id, 'GET', undefined, priya)).status, 404);
+    assert.equal((await (await app.request(path, 'POST', input, maya)).json()).id, id);
+    app.db.exec('UPDATE sessions SET expires_at = 0');
+    assert.equal((await app.request('/api/campaigns/launch/generations/' + id, 'GET', undefined, maya)).status, 401);
+  } finally { await app.close(); }
+});
+
+test('different-key race still creates one active job; production fake controls are unavailable', async () => {
+  const app = await harness();
+  try {
+    const token = await app.session('maya');
+    const responses = await Promise.all(['first-request', 'second-request'].map(key => app.request('/api/campaigns/launch/generate', 'POST', { key, briefRevision: 1, draftRevision: 1 }, token)));
+    assert.deepEqual(responses.map(r => r.status).sort(), [202, 409]);
+  } finally { await app.close(); }
+  for (const env of ['production', 'staging', '']) {
+    const app = await harness(env);
+    try {
+      for (const name of ['generation-scenario', 'generation-release']) assert.equal((await app.request('/__test/' + name, 'POST', {})).status, 404);
+    } finally { await app.close(); }
+  }
 });

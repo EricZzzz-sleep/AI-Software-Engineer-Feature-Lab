@@ -3,7 +3,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { readFileSync } from 'node:fs';
 import type { DatabaseSync } from 'node:sqlite';
 import { actors, isTestEnvironment, seed } from './db.js';
-import { openAIGenerator, type DraftGenerator } from './generation.js';
+import { enqueue, getJob, jobStatus, configureScenario, releaseJob } from './jobs.js';
 import { access, detail, HttpError, mutate, only, versionHistory, versionDetail, reviewVersion } from './campaigns.js';
 
 const hash = (token: string) => createHash('sha256').update(token).digest('hex');
@@ -26,10 +26,16 @@ function json(res: ServerResponse, status: number, value: unknown): void {
   res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
   res.end(JSON.stringify(value));
 }
-export function createApp(db: DatabaseSync, env: string | undefined, generator: DraftGenerator | null = openAIGenerator({ apiKey: process.env.OPENAI_API_KEY, model: process.env.OPENAI_MODEL })) {
-  const generating = new Set<string>();
-  const campaignDetail = (actorId: string, id: string) => ({ ...detail(db, actorId, id), generationEnabled: !!generator });
+export function createApp(db: DatabaseSync, env: string | undefined) {
+  const campaignDetail = (actorId: string, id: string) => ({ ...detail(db, actorId, id), generationEnabled: isTestEnvironment(env) });
   const fixturesEnabled = isTestEnvironment(env);
+  function authenticate(req: IncomingMessage) {
+    const token = req.headers.authorization?.match(/^Bearer ([a-f0-9]{64})$/)?.[1];
+    const actor = token ? db.prepare(`SELECT a.id, a.name FROM sessions s JOIN actors a ON a.id = s.actor_id
+      WHERE s.token_hash = ? AND s.expires_at > ?`).get(hash(token), Date.now()) : undefined;
+    if (!actor || typeof actor.id !== 'string') throw new HttpError(401, 'Session expired. Sign in again; your text has been kept.');
+    return { id: actor.id, name: actor.name };
+  }
   return createServer(async (req, res) => {
     try {
       const path = new URL(req.url ?? '/', 'http://localhost').pathname;
@@ -42,6 +48,11 @@ export function createApp(db: DatabaseSync, env: string | undefined, generator: 
         if (!host || !/^127\.0\.0\.1(?::\d+)?$|^localhost(?::\d+)?$/.test(host) ||
           (origin && origin !== `http://${host}`) || req.headers['sec-fetch-site'] === 'cross-site') {
           throw new HttpError(403, 'Local same-origin requests only');
+        }
+        if (method === 'POST' && (path === '/__test/generation-scenario' || path === '/__test/generation-release')) {
+          const actor = authenticate(req);
+          const input = await body(req);
+          return json(res, 200, path.endsWith('scenario') ? configureScenario(db, actor.id, input) : releaseJob(db, actor.id, input));
         }
         if (method === 'GET' && path === '/__test/actors') return json(res, 200, actors);
         if (method === 'POST' && path === '/__test/session') {
@@ -74,13 +85,15 @@ export function createApp(db: DatabaseSync, env: string | undefined, generator: 
         return res.end(readFileSync(new URL(`../public/${file}`, import.meta.url)));
       }
       if (method === 'GET' && path === '/health') return json(res, 200, { status: 'ok' });
+      const jobRoute = path.match(/^\/api\/campaigns\/([^/]+)\/generations(?:\/([a-zA-Z0-9-]+))?$/);
       const versionRoute = path.match(/^\/api\/campaigns\/([^/]+)\/versions(?:\/(\d+)(\/review)?)?$/);
       const route = path.match(/^\/api\/campaigns\/([^/]+)(?:\/(review|publish|publications|generate)(?:\/(\d+))?)?$/);
-      if (path !== '/api/me' && path !== '/api/campaigns' && !route && !versionRoute) throw new HttpError(404, 'Not found');
-      const token = req.headers.authorization?.match(/^Bearer ([a-f0-9]{64})$/)?.[1];
-      const actor = token ? db.prepare(`SELECT a.id, a.name FROM sessions s JOIN actors a ON a.id = s.actor_id
-        WHERE s.token_hash = ? AND s.expires_at > ?`).get(hash(token), Date.now()) : undefined;
-      if (!actor || typeof actor.id !== 'string') throw new HttpError(401, 'Session expired. Sign in again; your text has been kept.');
+      if (path !== '/api/me' && path !== '/api/campaigns' && !route && !versionRoute && !jobRoute) throw new HttpError(404, 'Not found');
+      const actor = authenticate(req);
+      if (jobRoute) {
+        if (method !== 'GET') throw new HttpError(405, 'Method not allowed');
+        return json(res, 200, jobRoute[2] ? getJob(db, actor.id, jobRoute[1]!, jobRoute[2]) : jobStatus(db, actor.id, jobRoute[1]!));
+      }
       if (versionRoute) {
         const [, id, version, review] = versionRoute;
         if (method === 'GET' && !version) return json(res, 200, versionHistory(db, actor.id, id!));
@@ -103,30 +116,9 @@ export function createApp(db: DatabaseSync, env: string | undefined, generator: 
         }
         if (method === 'POST' && action === 'generate' && !route[3]) {
           access(db, actor.id, id, 'save');
-          const input = await body(req);
-          only(input, ['expectedVersion', 'goal', 'facts', 'tone', 'previousDraft']);
-          if (!Number.isSafeInteger(input.expectedVersion) || Number(input.expectedVersion) < 1) throw new HttpError(400, 'A valid expectedVersion is required');
-          const saved: Record<string, unknown> = detail(db, actor.id, id);
-          if (saved.version !== input.expectedVersion) throw new HttpError(409, 'This campaign changed on the server. Reload before generating.');
-          const brief = { goal: String(saved.goal), facts: String(saved.facts), tone: String(saved.tone) };
-          if (['goal', 'facts', 'tone'].some(key => key in input)) {
-            for (const key of ['goal', 'facts', 'tone'] as const) {
-              if (typeof input[key] !== 'string' || input[key].length > 20000) throw new HttpError(400, `${key} must be text of at most 20,000 characters`);
-              brief[key] = input[key];
-            }
-          }
-          if (input.previousDraft !== undefined && (typeof input.previousDraft !== 'string' || input.previousDraft.length > 20000)) throw new HttpError(400, 'previousDraft must be text of at most 20,000 characters');
-          if (!brief.goal.trim()) throw new HttpError(400, 'Add a goal and audience to the brief before generating.');
-          if (!generator) throw new HttpError(503, 'Generation is not configured. Set OPENAI_API_KEY on the server.');
-          if (generating.has(id)) throw new HttpError(409, 'Generation is already in progress for this campaign.');
-          generating.add(id);
-          try {
-            const draft = await generator({ ...brief, ...(typeof input.previousDraft === 'string' ? { previousDraft: input.previousDraft } : {}) });
-            const latest = access(db, actor.id, id, 'save');
-            const latestContent: Record<string, unknown> = detail(db, actor.id, id);
-            if (latest.version !== saved.version && ['goal', 'facts', 'tone'].some(key => latestContent[key] !== saved[key] && latestContent[key] !== brief[key as keyof typeof brief])) throw new HttpError(409, 'This campaign changed during generation. Your text has been kept. Reload and try again.');
-            return json(res, 200, { draft, expectedVersion: saved.version });
-          } finally { generating.delete(id); }
+          if (!fixturesEnabled) throw new HttpError(503, 'Generation is unavailable: F2 fake provider is limited to development/test');
+          const result = enqueue(db, actor.id, id, await body(req));
+          return json(res, result.created ? 202 : 200, result.job);
         }
         if (method === 'POST' && (action === 'review' || action === 'publish') && !route[3]) return json(res, 200, mutate(db, actor.id, id, action, await body(req)));
         if (method === 'GET' && action === 'publications' && route[3]) {
@@ -138,7 +130,7 @@ export function createApp(db: DatabaseSync, env: string | undefined, generator: 
       throw new HttpError(405, 'Method not allowed');
     } catch (error) {
       if (!(error instanceof HttpError)) console.error(error);
-      json(res, error instanceof HttpError ? error.status : 500, { error: error instanceof HttpError ? error.message : 'Internal server error' });
+      json(res, error instanceof HttpError ? error.status : 500, { error: error instanceof HttpError ? error.message : 'Internal server error', ...(error instanceof HttpError ? error.details : {}) });
     }
   });
 }

@@ -1,4 +1,4 @@
-/* global document, window, sessionStorage, fetch, Option */
+/* global document, window, sessionStorage, localStorage, fetch, Option, crypto, setInterval */
 const $ = id => document.getElementById(id);
 const fields = ['goal', 'facts', 'tone', 'draft'];
 let token = sessionStorage.getItem('lab-token') || '';
@@ -7,6 +7,8 @@ let current = null;
 let busy = false;
 let expired = false;
 let generating = false;
+let generationJob = null;
+let checkingGeneration = false;
 let actorOptions = [];
 let selectedVersion = null;
 const values = () => Object.fromEntries(fields.map(key => [key, $(key).value]));
@@ -19,16 +21,20 @@ function controls() {
   $('editor-tabs').hidden = !publisher;
   for (const id of ['edit-tab', 'versions-tab', 'version-select']) $(id).disabled = busy || generating;
   $('review-version').disabled = !publisher || busy || generating || expired || !selectedVersion || selectedVersion.reviewed;
-  fields.forEach(key => { $(key).readOnly = !editable || busy || generating; });
+  fields.forEach(key => { $(key).readOnly = !editable || busy; });
   $('save').disabled = !editable || busy || expired;
-  $('generate').disabled = !editable || busy || generating || expired || !current?.generationEnabled || !$('goal').value.trim();
-  $('generate').textContent = generating ? 'Generating…' : 'Generate';
-  $('generate-reason').textContent = !editable ? 'Only editors and publishers can generate.' : !current?.generationEnabled ? 'Generation is not configured' : !$('goal').value.trim() ? 'Add a goal and audience before generating.' : 'Generate a new variation from this brief. Save the draft you want to keep.';
+  const briefDirty = current && ['goal', 'facts', 'tone'].some(key => $(key).value !== current[key]);
+  const pending = current && readPending(generationScope());
+  $('generate').disabled = !editable || busy || generating || expired || !current?.generationEnabled || (!pending && (!current.goal.trim() || briefDirty || isActiveJob(generationJob)));
+  $('scenario').disabled = !editable || busy || generating || expired;
+  $('release-job').disabled = !editable || busy || !isActiveJob(generationJob);
+  $('generate').textContent = generating ? 'Submitting…' : generationJob?.status === 'failed' ? 'Retry generation' : generationJob?.status === 'obsolete' ? 'Regenerate' : 'Generate';
+  $('generate-reason').textContent = !editable ? 'Only editors and publishers can generate.' : !current?.generationEnabled ? 'Generation is not configured' : briefDirty ? 'Save your brief changes before generating.' : !current.goal.trim() ? 'Save a goal and audience before generating.' : isActiveJob(generationJob) ? 'Generation is running. You can leave and return to this job.' : 'Generate from the saved brief. Successful output is saved automatically.';
   $('review').disabled = !publisher || !!changed || busy || generating || expired;
   $('publish').disabled = !publisher || !!changed || busy || generating || expired || !current?.reviewed;
   $('workflow-reason').textContent = !publisher ? 'Only a publisher can review and publish.' : expired ? 'Sign in again to continue.' : busy ? 'Wait for the current action to finish.' : changed ? 'Save your changes before review or publish.' : !current?.reviewed ? 'Review this saved version before publishing.' : 'This saved version is reviewed and ready to publish.';
   $('saved').textContent = busy ? 'Working…' : changed ? `Unsaved · v${current?.version}` : `Saved v${current?.version}`;
-  $('draft-status').textContent = editable ? 'Editable text · saved with the brief' : 'Read only';
+  $('draft-status').textContent = `${editable ? 'Editable text · saved with the brief' : 'Read only'}${current?.draft_revision > 0 && current.draft_brief_revision < current.brief_revision ? ' · Out of date' : ''}`;
   $('actor').disabled = busy || generating;
   $('campaign').disabled = busy || generating;
   $('signin').disabled = busy || generating;
@@ -40,7 +46,9 @@ async function api(path, method = 'GET', data) {
   const result = await response.json();
   if (!response.ok) {
     if (response.status === 401) { expired = true; $('signin').textContent = 'Sign in again'; controls(); }
-    throw new Error(result.error || 'Request failed. Your text has been kept.');
+    const error = new Error(result.error || 'Request failed. Your text has been kept.');
+    error.status = response.status; error.activeJobId = result.activeJobId;
+    throw error;
   }
   return result;
 }
@@ -72,6 +80,11 @@ async function discardAllowed() {
   return !dirty() || await showDialog('Discard unsaved changes?', 'Your local brief and draft edits have not been saved. Continue only if you want to discard them.', '', 'Discard changes');
 }
 function render(data) {
+  if (current?.id !== data.id) {
+    generationJob = null;
+    $('generation-status').textContent = 'Loading generation status…';
+    $('job-id').textContent = '';
+  }
   current = data;
   selectedVersion = null;
   showEditorTab(false);
@@ -104,6 +117,7 @@ async function loadCampaign(id) {
     const data = await api(`/api/campaigns/${id}`);
     render(data);
     announce(`Saved version ${data.version} loaded.`);
+    await refreshGeneration();
   } finally { busy = wasBusy; controls(); }
 }
 async function loadSession() {
@@ -158,13 +172,29 @@ $('save').onclick = async () => {
 };
 $('generate').onclick = async () => {
   if ($('generate').disabled) return;
-  generating = true; controls(); announce('Generating a new draft variation…');
+  generating = true; controls();
+  const scope = generationScope();
+  const id = current.id;
+  const session = token;
   try {
-    const result = await api(`/api/campaigns/${current.id}/generate`, 'POST', { expectedVersion: current.version, goal: $('goal').value, facts: $('facts').value, tone: $('tone').value, previousDraft: $('draft').value });
-    $('draft').value = result.draft;
-    announce('Draft generated. Edit it as needed, then save before review or publish.');
-  } catch (error) { announce(`Generation failed. ${errorMessage(error)} Your existing text has been kept.`); }
-  finally { generating = false; controls(); $('draft').focus(); }
+    let pending = readPending(scope);
+    if (!pending) {
+      pending = { key: crypto.randomUUID(), briefRevision: current.brief_revision, draftRevision: current.draft_revision };
+      localStorage.setItem(scope, JSON.stringify(pending));
+    }
+    const result = await api(`/api/campaigns/${id}/generate`, 'POST', pending);
+    localStorage.removeItem(scope);
+    if (current?.id === id && token === session) {
+      generationJob = result;
+      displayGeneration();
+    }
+  } catch (error) {
+    if (error.status && error.status < 500) localStorage.removeItem(scope);
+    if (current?.id === id && token === session) {
+      $('generation-status').textContent = error.status ? errorMessage(error) : 'Submission outcome unknown. Retry Generate to reuse the same request key.';
+      if (error.activeJobId) await refreshGeneration();
+    }
+  } finally { generating = false; controls(); }
 };
 $('reload').onclick = async () => {
   if (!await discardAllowed()) return;
@@ -194,6 +224,7 @@ async function initialize() {
     if (response.ok) {
       actorOptions = await response.json();
       $('session-bar').hidden = false;
+      $('fake-generation').hidden = false;
       actorOptions.forEach(actor => $('actor').append(new Option(`${actor.name} / ${actor.role} · Workspace ${actor.workspaceId.toUpperCase()}`, actor.id)));
       $('actor').value = actorId;
     }
@@ -265,3 +296,53 @@ for (const id of ['edit-tab', 'versions-tab']) $(id).onkeydown = event => {
   const target = event.key === 'Home' ? 'edit-tab' : event.key === 'End' ? 'versions-tab' : id === 'edit-tab' ? 'versions-tab' : 'edit-tab';
   if (!$(target).disabled) { $(target).focus(); $(target).click(); }
 };
+
+function isActiveJob(job) { return job && ['queued', 'running', 'retrying'].includes(job.status); }
+function generationScope() { return `generation:${actorId}:${current.workspace_id}:${current.id}`; }
+function readPending(scope) {
+  try { return JSON.parse(localStorage.getItem(scope) || 'null'); }
+  catch { localStorage.removeItem(scope); return null; }
+}
+function displayGeneration() {
+  const job = generationJob;
+  $('job-id').textContent = job ? `Job ${job.id}` : '';
+  const labels = { queued: 'Queued', running: 'Generating', retrying: 'Retrying', succeeded: 'Draft saved', failed: 'Generation failed', obsolete: 'Generation out of date' };
+  $('generation-status').textContent = job ? `${labels[job.status]} · Attempt ${job.attempts}/2${job.error ? ` · ${job.error}` : ''}${job.status === 'obsolete' ? '. Your saved draft was preserved. Regenerate from the latest saved brief.' : job.status === 'failed' ? '. Your saved draft was preserved. You can retry with a new request.' : ''}` : 'No generation job yet.';
+  if (job?.status === 'succeeded' && current.version < job.appliedVersion && dirty()) $('generation-status').textContent += ' A new draft revision was saved. Your local edits are kept; reload saved content when ready.';
+  controls();
+}
+async function refreshGeneration() {
+  if (!current || !token || expired || checkingGeneration || generating) return;
+  const id = current.id, session = token;
+  checkingGeneration = true;
+  try {
+    const status = await api(`/api/campaigns/${id}/generations`);
+    if (current?.id !== id || token !== session) return;
+    generationJob = status.active || status.latest;
+    displayGeneration();
+    if (readPending(generationScope())) $('generation-status').textContent += ' An unconfirmed submission is saved locally. Retry Generate to resolve it with the same key.';
+    if (generationJob?.status === 'succeeded' && current.version < generationJob.appliedVersion && !dirty() && !busy && $('versions-panel').hidden && !$('dialog').open) {
+      const saved = await api(`/api/campaigns/${id}`);
+      if (current?.id === id && token === session && !dirty() && !busy && $('versions-panel').hidden && !$('dialog').open) { render(saved); displayGeneration(); }
+    }
+  } catch (error) {
+    if (current?.id === id && token === session) $('generation-status').textContent = `Status unavailable. ${errorMessage(error)} Reconnecting automatically.`;
+  } finally { checkingGeneration = false; }
+}
+$('scenario').onchange = async () => {
+  busy = true; controls();
+  try {
+    await api('/__test/generation-scenario', 'POST', { campaignId: current.id, scenario: $('scenario').value });
+    $('fake-status').textContent = 'Scenario saved for the next new job.';
+  } catch (error) { $('fake-status').textContent = errorMessage(error); }
+  finally { busy = false; controls(); }
+};
+$('release-job').onclick = async () => {
+  busy = true; controls();
+  try {
+    await api('/__test/generation-release', 'POST', { campaignId: current.id, jobId: generationJob.id });
+    $('fake-status').textContent = 'Job released.';
+  } catch (error) { $('fake-status').textContent = errorMessage(error); }
+  finally { busy = false; controls(); }
+};
+setInterval(() => { if (!busy && !document.hidden) refreshGeneration(); }, 1000);

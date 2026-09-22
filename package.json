@@ -16,7 +16,8 @@
     "db:migrate": "tsx src/cli.ts migrate",
     "db:seed": "tsx src/cli.ts seed",
     "db:reset": "tsx src/cli.ts reset",
-    "test:browser": "playwright test"
+    "test:browser": "playwright test",
+    "worker": "NODE_ENV=development tsx --env-file-if-exists=.env src/worker-cli.ts"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.0",

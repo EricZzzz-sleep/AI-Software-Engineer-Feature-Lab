@@ -37,6 +37,7 @@ instead; migrating alone does not create the new demo campaigns or actors.
 | Apply migrations | `npm run db:migrate` |
 | Seed/reset fixtures | `NODE_ENV=development npm run db:seed` / `NODE_ENV=development npm run db:reset` |
 | Development | `npm run dev` |
+| Generation worker (second terminal) | `npm run worker` |
 | API/database tests | `npm test` |
 | Install browser for tests (once) | `npx playwright install chromium` |
 | Browser tests | `npm run test:browser` |
@@ -62,29 +63,28 @@ read-only snapshots available under Published versions; later edits never change
 them. Repeating a successful publication returns the same snapshot, even after
 newer edits exist.
 
-Generate calls the server, which sends the current goal/audience, source facts, tone, and previous draft to the [OpenAI Responses API](https://developers.openai.com/api/docs/guides/text).
-Copy `.env.example` to `.env`, set `OPENAI_API_KEY`, and restart `npm run dev`.
-`OPENAI_MODEL` defaults to `gpt-4.1-mini` and can be changed to a Responses-compatible
-text model available to your account. Both dev and production start commands load
-`.env`; existing environment variables take precedence. The key stays on the server.
+Generate now submits a durable job from the **saved brief**. Save goal/facts/tone
+changes first. Draft edits may remain unsaved; successful output is saved by the
+worker, and the browser never replaces a dirty form. A clean form loads the saved
+result automatically. A dirty form keeps its original version and offers explicit
+Reload saved content; saving stale edits still returns 409.
 
-Select Generate using the current brief, including unsaved edits. A goal/audience
-is required; facts and tone are optional. Generate can be used again after each
-request without saving first; the previous draft is included to request different
-wording and structure. Save is available even without changes and during generation. The result replaces the local draft and remains unsaved until
-Save is selected. The prior saved version remains available through Reload saved
-content. Review and publish stay disabled while the generated draft is unsaved.
-Generation never automatically saves, reviews, or publishes. Provider errors and
-60-second timeouts preserve existing text. Concurrent generation for the same
-campaign is rejected within the server process, and conflicting brief changes while generating
-reject the stale result. Saving the requested brief or just the draft during
-generation is allowed. Requests are not automatically retried. Responses are
-requested with `store: false`; the brief is still transmitted to OpenAI for processing.
+F2 uses deterministic local fake providers only. No OpenAI API key or model call
+is required; the previous synchronous live-provider implementation is replaced.
+Production generation is disabled, while authorized persisted status/results remain
+readable. Start the worker in a second terminal, from the same repository directory:
+
+```sh
+npm run worker
+```
+
+Web server and worker must use the same `DATABASE_PATH` (default `data/lab.sqlite`).
+Both commands load optional `.env` settings. Jobs remain queued while the worker is
+stopped and resume when it starts. The worker rejects non-development/test execution.
 
 Saving failures and stale-version conflicts preserve local text. A conflict returns
 409 and requires an explicit reload to see newer server content; reloading or
-switching actor/campaign asks before discarding unsaved changes. There is no silent
-background replacement or automatic merge. Session expiry preserves the form;
+switching actor/campaign asks before discarding unsaved changes. Dirty text is never replaced in the background or automatically merged. Session expiry preserves the form;
 Sign in again renews the same actor without replacing local text. Browser navigation
 warns while dirty; local unsaved text is not persisted across a confirmed page exit.
 
@@ -114,7 +114,9 @@ stored as SHA-256 hashes, and expire after one hour.
 | `GET /api/campaigns` | Accessible campaigns only |
 | `GET /api/campaigns/:id` | Current saved content, version, review flag, publication list |
 | `PUT /api/campaigns/:id` | Atomic save with `expectedVersion`, `goal`, `facts`, `tone`, `draft` |
-| `POST /api/campaigns/:id/generate` | Generate with `expectedVersion`, optional `goal`/`facts`/`tone` (all three together), and optional `previousDraft`; returns unsaved `{ draft, expectedVersion }` |
+| `POST /api/campaigns/:id/generate` | `{ "key": "unique-request-key", "briefRevision": 1, "draftRevision": 1 }`; 202 for a new job, 200 for identical replay |
+| `GET /api/campaigns/:id/generations` | Active job and latest terminal job |
+| `GET /api/campaigns/:id/generations/:jobId` | Authorized persisted status/result |
 | `POST /api/campaigns/:id/review` | Review `{ "expectedVersion": 1 }` |
 | `POST /api/campaigns/:id/publish` | Publish `{ "expectedVersion": 1 }`; requires review |
 | `GET /api/campaigns/:id/publications/:publicationId` | Immutable publication with JSON snapshot |
@@ -128,7 +130,7 @@ and compare the expected version under the write lock.
 
 Only exact `NODE_ENV=development` or `test` enables these endpoints and the actor
 switcher. Controls reject foreign browser origins and non-loopback Host headers.
-They are unauthenticated local lab tools; keep the development server local.
+Session/fixture setup endpoints are unauthenticated local lab tools; keep the development server local. Generation scenario/release controls additionally require a valid session with save permission.
 
 - `GET /__test/actors`: four fixture identities.
 - `POST /__test/session`: `{ "actorId": "maya" }` (also `ren`, `evan`, `priya`).
@@ -169,3 +171,92 @@ Publisher-only, workspace-scoped endpoints:
   that exact saved revision, even if a newer revision has since been saved.
 
 The existing current-version review endpoint retains its stale-version check.
+
+
+### F2 durable generation: invariants and recovery
+
+Migration 003 backfills independent brief/draft revision counters without changing
+campaign version numbers, historical approvals, or publications. An initially
+absent (empty) draft has revision 0; after the first draft, revisions increase even
+when the draft is cleared. A brief-only save retains draft provenance and labels
+an older draft **Out of date**. Generated output creates a new draft/campaign
+revision even if its text happens to match an earlier draft.
+
+Job admission inserts the immutable brief snapshot, job, outbox work, and active
+campaign generation ID in one SQLite transaction. A partial unique index enforces
+one active job per campaign. Keys are scoped to workspace/campaign; identical key
+and canonical revisions return the original job, including a terminal job, before
+checking current revisions. Reusing a key with changed revisions is a 409. Another
+key while a job is active returns 409 with its authorized `activeJobId`.
+
+The browser stores unresolved keys/payloads in localStorage scoped to actor,
+workspace, and campaign. Transport retry reuses the original payload; a new request
+after terminal failure uses a new key. Status is read from the database on return
+and polled every second while visible. Status states are queued, running, retrying,
+succeeded, failed, and obsolete. IDs and status are not dependent on a browser tab.
+
+The worker uses short transactions to claim outbox work with leases and fencing
+tokens; provider calls run outside transactions. Every attempt and deadline is
+persisted. Defaults are 30 seconds per attempt, one second backoff, two attempts
+maximum, and a 65-second job budget beginning at first claim (queue wait excluded).
+Leases expire two seconds after their attempt deadline. Timeout/transient errors
+retry once; malformed and other errors fail immediately. Interrupted work consumes
+an attempt and can resume only within the same budget. Late or unfenced responses
+cannot apply. Output must contain a nonempty string `draft`, at most 20,000 characters.
+
+Result application atomically checks brief revision, base draft revision, active
+generation ID, and lease ownership before saving. A mismatch marks the job obsolete
+without changing the saved draft; UI offers regeneration. Success writes the draft,
+job result, and completed outbox state together. There is no separate commit-to-ack
+gap: simulated replay after commit is a no-op. Provider work can repeat after a
+crash, but result application is at most once. Errors/results stay durable, and
+workspace checks protect every status/result read. Viewers can read but cannot
+create jobs or use fake controls.
+
+### Fake scenarios and mentor F2 gate
+
+Choose **Test generation scenario** before Generate. Settings affect only new jobs;
+an existing job retains its captured scenario. Controls are development/test-only,
+local same-origin, authenticated, and workspace scoped:
+
+- `POST /__test/generation-scenario`: `{ "campaignId": "launch", "scenario": "success" }`.
+- `POST /__test/generation-release`: `{ "campaignId": "launch", "jobId": "..." }`.
+
+| Scenario | Behavior |
+| --- | --- |
+| success | Valid deterministic output from the captured goal and facts |
+| delayed_success | Wait for **Release delayed job**, subject to normal deadlines |
+| timeout | Both attempts reach their deadlines |
+| malformed | Wrong field type; fail before saving |
+| transient_then_ok | First call fails transiently, second succeeds |
+
+The mentor repeats this gate before advancing:
+
+1. Start the web server and worker against the same database. As Maya, save a brief,
+   generate with delayed_success, note the job ID, navigate away, and return. The
+   same job/status must appear. Release within its deadline and verify a saved draft
+   survives refresh.
+2. Generate with delayed_success again. Save a newer brief before releasing it.
+   Confirm **Generation out of date**, preserved draft, and Regenerate. Repeat with
+   a newer saved draft. A newer draft must never be replaced by an old result.
+3. Leave unsaved edits in the form while releasing a valid job. Confirm the worker
+   saves its result but the form preserves every edit until explicit reload.
+4. Run malformed and timeout; confirm unchanged saved content, durable terminal
+   errors, and a new-key retry. Run transient_then_ok and confirm success at attempt 2.
+5. Stop the worker before enqueueing; start it and confirm queued work resumes.
+   Force-stop it during delayed_success and restart: lease recovery consumes the
+   interrupted attempt; release during the remaining budget. If it expires, use
+   Retry generation for a fresh job. Never reset fixtures to simulate a restart.
+6. Verify Evan cannot generate, and Priya cannot read Workspace A job status/results
+   or release its jobs. Fixture reset clears jobs, attempts, outbox, and scenarios;
+   an old in-flight worker cannot write into reset fixtures.
+7. Run the automated gate: `npm test`, `npm run test:browser`, `npm run typecheck`,
+   `npm run lint`, `npm run build`. Tests cover raced same/different keys, atomic
+   rollback, persisted migration/revisions, late results, duplicate delivery,
+   actual killed/restarted worker processes, bounded attempts, lost admission
+   responses, preserved edits, and cross-workspace denial. Record results before
+   mentor advancement.
+
+Browser tests use an isolated in-memory database with a worker loop and shorter
+injected deadlines; worker/restart tests use temporary on-disk databases. No tests
+invoke live model services.

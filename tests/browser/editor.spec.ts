@@ -13,9 +13,9 @@ test.beforeEach(async ({ request }) => {
 
 test('explicit save, dirty explanations and failed save preserve text', async ({ page }) => {
   await login(page);
-  await expect(page.locator('#generate-reason')).toHaveText('Generation is not configured');
+  await expect(page.locator('#generate-reason')).toContainText('Generate from the saved brief');
   await page.getByLabel('Draft text').fill('Local draft to preserve');
-  await expect(page.locator('#generate-reason')).toHaveText('Generation is not configured');
+  await expect(page.locator('#generate-reason')).toContainText('Generate from the saved brief');
   await page.route('**/api/campaigns/launch', route => route.request().method() === 'PUT'
     ? route.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ error: 'Temporary save failure. Your text has been kept.' }) }) : route.continue());
   await page.getByRole('button', { name: 'Save', exact: true }).click();
@@ -129,6 +129,7 @@ test('keyboard order, focus visibility and live status', async ({ page }) => {
   await page.keyboard.press('Tab'); await expect(page.getByLabel('Source facts')).toBeFocused();
   await page.keyboard.press('Tab'); await expect(page.getByLabel('Tone', { exact: true })).toBeFocused();
   await page.keyboard.press('Tab'); await expect(page.locator('#save')).toBeFocused();
+  await page.keyboard.press('Tab'); await expect(page.locator('#generate')).toBeFocused();
   await page.keyboard.press('Tab'); await expect(page.getByLabel('Draft text')).toBeFocused();
   const outline = await page.getByLabel('Draft text').evaluate(el => getComputedStyle(el).outlineWidth);
   expect(outline).toBe('3px');
@@ -170,66 +171,6 @@ test('actual 200% browser zoom reflows the editor without overflow', async () =>
     await expect(page.locator('#status')).toContainText('reviewed');
     await page.screenshot({ path: 'test-results/editor-zoom-200.png' });
   } finally { await context.close(); rmSync(extension, { recursive: true, force: true }); }
-});
-
-test('generate displays an editable unsaved draft, saves it, and preserves it on provider failure', async ({ page }) => {
-  await page.route('**/api/campaigns/launch', async route => {
-    const response = await route.fetch();
-    await route.fulfill({ response, json: { ...await response.json(), generationEnabled: true } });
-  });
-  await page.route('**/api/campaigns/launch/generate', async route => {
-    expect(route.request().postDataJSON()).toMatchObject({ expectedVersion: 1 });
-    await route.fulfill({ json: { draft: 'Generated launch copy', expectedVersion: 1 } });
-  });
-  await login(page, 'ren');
-  await page.locator('#generate').click();
-  await expect(page.getByLabel('Draft text')).toHaveValue('Generated launch copy');
-  await expect(page.locator('#saved')).toHaveText('Unsaved · v1');
-  await expect(page.locator('#review')).toBeDisabled();
-  await expect(page.locator('#generate')).toBeEnabled();
-  await page.locator('#save').click();
-  await expect(page.locator('#saved')).toHaveText('Saved v2');
-  await page.unroute('**/api/campaigns/launch/generate');
-  await page.route('**/api/campaigns/launch/generate', route => route.fulfill({ status: 504, json: { error: 'Generation timed out. Try again.' } }));
-  await page.locator('#generate').click();
-  await expect(page.locator('#status')).toContainText('Generation timed out');
-  await expect(page.getByLabel('Draft text')).toHaveValue('Generated launch copy');
-  await expect(page.locator('#generate')).toBeEnabled();
-  await page.reload();
-  await expect(page.getByLabel('Draft text')).toHaveValue('Generated launch copy');
-});
-
-test('save is available without changes and during generation; repeated generation uses the current brief and draft', async ({ page }) => {
-  await page.route('**/api/campaigns/launch', async route => {
-    const response = await route.fetch();
-    await route.fulfill({ response, json: { ...await response.json(), generationEnabled: true } });
-  });
-  let release!: () => void;
-  let calls = 0;
-  await page.route('**/api/campaigns/launch/generate', async route => {
-    calls++;
-    const input = route.request().postDataJSON();
-    expect(input.goal).toBe('A new unsaved brief');
-    if (calls === 1) await new Promise<void>(resolve => { release = resolve; });
-    else expect(input.previousDraft).toBe('Variation 1');
-    await route.fulfill({ json: { draft: `Variation ${calls}`, expectedVersion: input.expectedVersion } });
-  });
-  await login(page);
-  await expect(page.locator('#save')).toBeEnabled();
-  await page.locator('#save').click();
-  await expect(page.locator('#status')).toHaveText('Saved version 1.');
-  await page.getByLabel('Goal + audience').fill('A new unsaved brief');
-  await page.locator('#generate').click();
-  await expect.poll(() => calls).toBe(1);
-  await expect(page.locator('#save')).toBeEnabled();
-  await page.locator('#save').click();
-  await expect(page.locator('#saved')).toHaveText('Saved v2');
-  release();
-  await expect(page.getByLabel('Draft text')).toHaveValue('Variation 1');
-  await page.locator('#generate').click();
-  await expect(page.getByLabel('Draft text')).toHaveValue('Variation 2');
-  await page.locator('#save').click();
-  await expect(page.locator('#saved')).toHaveText('Saved v3');
 });
 
 const briefFields = ['goal', 'facts', 'tone', 'draft'];
@@ -290,4 +231,121 @@ test('version review tabs support keyboard selection and failed loads cannot app
   await expect(page.locator('#versions-status')).toHaveText('Unable to load version');
   await expect(page.locator('#review-version')).toBeDisabled();
   await expect(page.locator('#version-preview')).toBeEmpty();
+});
+
+async function scenario(page: Page, value: string) {
+  await page.getByLabel('Test generation scenario').selectOption(value);
+  await expect(page.locator('#fake-status')).toHaveText('Scenario saved for the next new job.');
+}
+
+test('durable job survives refresh and navigation, then automatically restores its saved result', async ({ page }) => {
+  await login(page);
+  await scenario(page, 'delayed_success');
+  await page.locator('#generate').click();
+  await expect(page.locator('#job-id')).toContainText('Job ');
+  const id = await page.locator('#job-id').textContent();
+  await page.goto('/health');
+  await page.goto('/');
+  await expect(page.locator('#job-id')).toHaveText(id!);
+  await page.reload();
+  await expect(page.locator('#job-id')).toHaveText(id!);
+  await expect(page.locator('#generate')).toBeDisabled();
+  await page.locator('#release-job').click();
+  await expect(page.locator('#generation-status')).toContainText('Draft saved');
+  await expect(page.locator('#saved')).toHaveText('Saved v2');
+  await expect(page.getByLabel('Draft text')).toHaveValue(/Shared availability/);
+  await page.reload();
+  await expect(page.locator('#job-id')).toHaveText(id!);
+  await expect(page.locator('#generation-status')).toContainText('Draft saved');
+});
+
+test('saving a newer brief makes paused output obsolete and offers regeneration', async ({ page }) => {
+  await login(page);
+  const original = await page.getByLabel('Draft text').inputValue();
+  await scenario(page, 'delayed_success');
+  await page.locator('#generate').click();
+  await expect(page.locator('#job-id')).toContainText('Job ');
+  await page.getByLabel('Goal + audience').fill('Updated saved brief');
+  await page.locator('#save').click();
+  await expect(page.locator('#saved')).toHaveText('Saved v2');
+  await page.locator('#release-job').click();
+  await expect(page.locator('#generation-status')).toContainText('Generation out of date');
+  await expect(page.getByLabel('Draft text')).toHaveValue(original);
+  await expect(page.locator('#draft-status')).toContainText('Out of date');
+  await expect(page.getByRole('button', { name: 'Regenerate', exact: true })).toBeEnabled();
+  await scenario(page, 'success');
+  await page.locator('#generate').click();
+  await expect(page.locator('#saved')).toHaveText('Saved v3');
+  await expect(page.getByLabel('Draft text')).toHaveValue(/Updated saved brief/);
+});
+
+test('successful background generation preserves unsaved input and stale save conflicts', async ({ page }) => {
+  await login(page);
+  await scenario(page, 'delayed_success');
+  await page.locator('#generate').click();
+  await expect(page.locator('#job-id')).toContainText('Job ');
+  await page.getByLabel('Draft text').fill('My unsaved draft');
+  await page.locator('#release-job').click();
+  await expect(page.locator('#generation-status')).toContainText('Your local edits are kept');
+  await expect(page.getByLabel('Draft text')).toHaveValue('My unsaved draft');
+  await expect(page.locator('#saved')).toHaveText('Unsaved · v1');
+  await page.locator('#save').click();
+  await expect(page.locator('#status')).toContainText('changed on the server');
+  await page.locator('#reload').click(); await page.locator('#dialog-cancel').click();
+  await expect(page.getByLabel('Draft text')).toHaveValue('My unsaved draft');
+  await page.locator('#reload').click(); await page.locator('#dialog-confirm').click();
+  await expect(page.locator('#saved')).toHaveText('Saved v2');
+});
+
+test('malformed failure is durable and a new retry key can recover without losing the draft', async ({ page }) => {
+  await login(page);
+  const original = await page.getByLabel('Draft text').inputValue();
+  await scenario(page, 'malformed');
+  const sent: string[] = [];
+  page.on('request', req => { if (req.url().endsWith('/generate')) sent.push(req.postDataJSON().key); });
+  await page.locator('#generate').click();
+  await expect(page.locator('#generation-status')).toContainText('Generation failed');
+  const oldJob = await page.locator('#job-id').textContent();
+  await page.reload();
+  await expect(page.locator('#job-id')).toHaveText(oldJob!);
+  await expect(page.getByLabel('Draft text')).toHaveValue(original);
+  await scenario(page, 'transient_then_ok');
+  await page.getByRole('button', { name: 'Retry generation' }).click();
+  await expect(page.locator('#generation-status')).toContainText('Draft saved · Attempt 2/2');
+  expect(sent).toHaveLength(2); expect(sent[0]).not.toBe(sent[1]);
+});
+
+test('lost submission response reuses its stored key after refresh and returns the same job', async ({ page }) => {
+  await login(page);
+  await scenario(page, 'delayed_success');
+  const keys: string[] = [];
+  let jobId = '';
+  await page.route('**/generate', async route => {
+    keys.push(route.request().postDataJSON().key);
+    const response = await route.fetch();
+    jobId = (await response.json()).id;
+    await route.abort('failed');
+  });
+  await page.locator('#generate').click();
+  await expect(page.locator('#generation-status')).toContainText('Submission outcome unknown');
+  await page.unroute('**/generate');
+  page.on('request', req => { if (req.url().endsWith('/generate')) keys.push(req.postDataJSON().key); });
+  await page.reload();
+  await expect(page.locator('#job-id')).toHaveText(`Job ${jobId}`);
+  await page.locator('#generate').click();
+  await expect(page.locator('#generate')).toBeDisabled();
+  expect(keys).toHaveLength(2); expect(keys[0]).toBe(keys[1]);
+  await page.locator('#release-job').click();
+  await expect(page.locator('#generation-status')).toContainText('Draft saved');
+  await expect(page.locator('#saved')).toHaveText('Saved v2');
+});
+
+test('timeout exhausts exactly two attempts and preserves saved draft', async ({ page }) => {
+  await login(page);
+  const original = await page.getByLabel('Draft text').inputValue();
+  await scenario(page, 'timeout');
+  await page.locator('#generate').click();
+  await expect(page.locator('#generation-status')).toContainText('Generation failed · Attempt 2/2', { timeout: 10000 });
+  await expect(page.getByLabel('Draft text')).toHaveValue(original);
+  await expect(page.locator('#saved')).toHaveText('Saved v1');
 });

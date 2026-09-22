@@ -1,7 +1,7 @@
 import type { DatabaseSync } from 'node:sqlite';
 
 export class HttpError extends Error {
-  constructor(public status: number, message: string) { super(message); }
+  constructor(public status: number, message: string, public details?: Record<string, unknown>) { super(message); }
 }
 export function only(value: Record<string, unknown>, keys: string[]): void {
   if (Object.keys(value).some(key => !keys.includes(key))) throw new HttpError(400, 'Unexpected request field');

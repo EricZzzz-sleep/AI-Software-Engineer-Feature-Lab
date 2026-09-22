@@ -44,7 +44,7 @@ export function seed(db: DatabaseSync, env: string | undefined, scenario: 'defau
   if (!isTestEnvironment(env)) throw new Error('Fixtures require NODE_ENV=development or test');
   db.exec('BEGIN IMMEDIATE');
   try {
-    db.exec(`DELETE FROM publications; DELETE FROM reviews; DELETE FROM campaign_versions;
+    db.exec(`DELETE FROM generation_attempts; DELETE FROM generation_outbox; DELETE FROM generation_jobs; DELETE FROM generation_scenarios; DELETE FROM publications; DELETE FROM reviews; DELETE FROM campaign_versions;
       DELETE FROM campaigns; DELETE FROM memberships; DELETE FROM workspaces;
       DELETE FROM sessions; DELETE FROM projects; DELETE FROM actors; DELETE FROM provider_controls;`);
     db.exec("INSERT INTO workspaces VALUES ('a', 'Workspace A'), ('b', 'Workspace B')");
@@ -58,7 +58,7 @@ export function seed(db: DatabaseSync, env: string | undefined, scenario: 'defau
         ['launch', 'a', 'Team scheduling launch', 'maya'],
         ['workspace-b', 'b', 'Workspace B campaign', 'priya'],
       ] as const) {
-        db.prepare('INSERT INTO campaigns VALUES (?, ?, ?, 1)').run(id, workspace, title);
+        db.prepare('INSERT INTO campaigns (id, workspace_id, title, version) VALUES (?, ?, ?, 1)').run(id, workspace, title);
         db.prepare('INSERT INTO campaign_versions (campaign_id, version, goal, facts, tone, draft, saved_by) VALUES (?, 1, ?, ?, ?, ?, ?)')
           .run(id, 'Introduce team scheduling to busy team leads.', 'Shared availability. Fewer scheduling messages.', 'Clear and friendly', 'Bring your team together with simpler scheduling.', owner);
       }

@@ -56,3 +56,7 @@ dialog::backdrop { background: #0006; }
 #editor-tabs [aria-selected="true"] { background: #171717; color: white; }
 #versions-panel { margin-top: var(--s6); }
 #version-preview { white-space: pre-wrap; overflow-wrap: anywhere; padding: var(--s4); background: #f4f4f2; border: 1px solid #ccc; border-radius: 4px; margin-bottom: var(--s4); }
+
+#generation-panel { margin-top: var(--s4); }
+#job-id { overflow-wrap: anywhere; }
+#fake-generation { margin-top: var(--s3); }

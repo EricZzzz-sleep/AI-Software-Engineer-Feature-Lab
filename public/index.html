@@ -17,6 +17,21 @@
     <div class="campaign-picker" id="picker" hidden><label for="campaign">Campaign</label><select id="campaign"></select></div>
     <article id="editor" hidden aria-labelledby="title">
       <header><h1 id="title">Campaign</h1><span id="saved">Saved</span></header>
+      <section id="generation-panel" aria-labelledby="generation-heading">
+        <h2 id="generation-heading">Generation status</h2>
+        <p id="generation-status" role="status" aria-live="polite">Loading generation status…</p>
+        <p id="job-id" class="hint"></p>
+        <div id="fake-generation" hidden>
+          <label for="scenario">Test generation scenario</label>
+          <select id="scenario">
+            <option value="success">success</option><option value="delayed_success">delayed_success</option>
+            <option value="timeout">timeout</option><option value="malformed">malformed</option>
+            <option value="transient_then_ok">transient_then_ok</option>
+          </select>
+          <button id="release-job" type="button" disabled>Release delayed job</button>
+          <p id="fake-status" role="status"></p>
+        </div>
+      </section>
       <div id="editor-tabs" role="tablist" aria-label="Campaign views" hidden>
         <button id="edit-tab" type="button" role="tab" aria-selected="true" aria-controls="edit-panel">Edit campaign</button>
         <button id="versions-tab" type="button" role="tab" aria-selected="false" aria-controls="versions-panel" tabindex="-1">Review versions</button>
